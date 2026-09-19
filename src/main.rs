@@ -98,6 +98,11 @@ fn main() -> anyhow::Result<()> {
         let agent = RLAgent::load(model_dir)?;
         let sections = raw.as_object().ok_or_else(|| anyhow::anyhow!("expected top-level object"))?;
 
+        // Warm up (candle allocator, first-call jit-ish overhead) before timing, so the reported
+        // per-section numbers are steady-state — matching how jev/gliner report warm latency.
+        let warmup_q = Question { qtype: QType::Noul, instructions: "warmup".into(), choice_criteria: vec![], score_criteria: vec![], noul_true: None, noul_false: None };
+        agent.system_one(&json!("warmup"), &[("w".to_string(), warmup_q)])?;
+
         let mut out: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
         for (section, body) in sections {
             let state = body.get("state").ok_or_else(|| anyhow::anyhow!("{section}: missing state"))?.clone();
@@ -117,7 +122,10 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
 
+            let t0 = std::time::Instant::now();
             let answers = agent.system_one(&state, &questions)?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
+            eprintln!("{section}: {} questions in {elapsed_ms:.2} ms ({:.2} ms/question)", questions.len(), elapsed_ms / questions.len() as f64);
             let mut section_out = BTreeMap::new();
             for (qid, answer) in answers {
                 let v = match answer {
@@ -134,7 +142,6 @@ fn main() -> anyhow::Result<()> {
                 };
                 section_out.insert(qid, v);
             }
-            eprintln!("{section}: answered {} questions", section_out.len());
             out.insert(section.clone(), section_out);
         }
 

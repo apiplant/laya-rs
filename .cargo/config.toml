@@ -1,0 +1,2 @@
+[env]
+CUDARC_CUDA_VERSION = "13030"

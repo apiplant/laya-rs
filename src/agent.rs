@@ -76,7 +76,7 @@ impl RLAgent {
         let encoder_cfg: ModernBertConfig =
             serde_json::from_str(&std::fs::read_to_string(dir.join("encoder").join("config.json"))?)?;
 
-        let device = Device::Cpu;
+        let device = Device::cuda_if_available(0)?;
         let n_act = cfg.act_costs.len() + 1;
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)?
