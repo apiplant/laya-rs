@@ -4,6 +4,38 @@
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+thread_local! {
+    static PHASE_NS: RefCell<BTreeMap<&'static str, u128>> = RefCell::new(BTreeMap::new());
+}
+
+/// Adds `dur` to the running total for `phase`, only when `LAYA_TIMING=1` (checked once by the
+/// caller and passed in, so this stays a no-op branch in the hot path otherwise). Synchronizes
+/// the device first so the measured duration reflects actual GPU compute, not just dispatch.
+fn record_phase(debug_timing: bool, device: &Device, phase: &'static str, t0: std::time::Instant) -> Result<()> {
+    if !debug_timing {
+        return Ok(());
+    }
+    device.synchronize()?;
+    let ns = t0.elapsed().as_nanos();
+    PHASE_NS.with(|m| *m.borrow_mut().entry(phase).or_insert(0) += ns);
+    Ok(())
+}
+
+fn dump_phases() {
+    PHASE_NS.with(|m| {
+        let m = m.borrow();
+        let total: u128 = m.values().sum();
+        eprintln!("[timing] --- per-phase breakdown (summed across all layers) ---");
+        for (phase, ns) in m.iter() {
+            eprintln!("[timing]   {phase:<16} {:8.2}ms  ({:5.1}%)", *ns as f64 / 1e6, *ns as f64 / total as f64 * 100.0);
+        }
+        eprintln!("[timing]   {:<16} {:8.2}ms", "TOTAL", total as f64 / 1e6);
+    });
+    PHASE_NS.with(|m| m.borrow_mut().clear());
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModernBertConfig {
@@ -53,14 +85,24 @@ impl MlpGeglu {
         Ok(Self { wi, wo })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, debug_timing: bool) -> Result<Tensor> {
+        let t0 = std::time::Instant::now();
         let x = self.wi.forward(x)?;
+        record_phase(debug_timing, x.device(), "mlp.wi", t0)?;
+
+        let t0 = std::time::Instant::now();
         let last = x.dim(D::Minus1)?;
         let half = last / 2;
         let gate = x.narrow(D::Minus1, 0, half)?;
         let up = x.narrow(D::Minus1, half, half)?;
         let gate = gate.gelu_erf()?;
-        self.wo.forward(&(gate * up)?)
+        let gated = (gate * up)?;
+        record_phase(debug_timing, gated.device(), "mlp.gelu_gate", t0)?;
+
+        let t0 = std::time::Instant::now();
+        let out = self.wo.forward(&gated)?;
+        record_phase(debug_timing, out.device(), "mlp.wo", t0)?;
+        Ok(out)
     }
 }
 
@@ -78,24 +120,47 @@ impl Attention {
         Ok(Self { wqkv, wo, n_heads, head_dim: hidden / n_heads })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, debug_timing: bool) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
+
+        let t0 = std::time::Instant::now();
         let qkv = self.wqkv.forward(x)?; // [b, s, 3*hidden]
+        record_phase(debug_timing, x.device(), "attn.wqkv", t0)?;
+
+        let t0 = std::time::Instant::now();
         let qkv = qkv.reshape((b, s, 3, self.n_heads, self.head_dim))?;
         let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?; // [b,h,s,d]
         let k = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
         let v = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
+        record_phase(debug_timing, x.device(), "attn.split", t0)?;
 
+        let t0 = std::time::Instant::now();
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
+        record_phase(debug_timing, x.device(), "attn.rope", t0)?;
 
+        let t0 = std::time::Instant::now();
         let scale = 1f64 / (self.head_dim as f64).sqrt();
         let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?; // [b,h,s,s]
+        record_phase(debug_timing, x.device(), "attn.qk_matmul", t0)?;
+
+        let t0 = std::time::Instant::now();
         let attn = attn.broadcast_add(mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+        record_phase(debug_timing, x.device(), "attn.mask_softmax", t0)?;
+
+        let t0 = std::time::Instant::now();
         let out = attn.matmul(&v)?; // [b,h,s,d]
+        record_phase(debug_timing, x.device(), "attn.av_matmul", t0)?;
+
+        let t0 = std::time::Instant::now();
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, self.n_heads * self.head_dim))?;
-        self.wo.forward(&out)
+        record_phase(debug_timing, x.device(), "attn.merge", t0)?;
+
+        let t0 = std::time::Instant::now();
+        let out = self.wo.forward(&out)?;
+        record_phase(debug_timing, x.device(), "attn.wo", t0)?;
+        Ok(out)
     }
 }
 
@@ -213,16 +278,17 @@ impl ModernBert {
             } else {
                 (&cos_l, &sin_l, &local_mask)
             };
-            let attn_out = layer.attn.forward(&normed, cos, sin, mask)?;
+            let attn_out = layer.attn.forward(&normed, cos, sin, mask, debug_timing)?;
             h = (residual + attn_out)?;
 
             let residual = h.clone();
             let normed = layer.mlp_norm.forward(&h)?;
-            let mlp_out = layer.mlp.forward(&normed)?;
+            let mlp_out = layer.mlp.forward(&normed, debug_timing)?;
             h = (residual + mlp_out)?;
         }
         if debug_timing { self.device.synchronize()?; }
         if debug_timing { eprintln!("[timing]   {} layers: {:.2}ms", self.layers.len(), t0.elapsed().as_secs_f64() * 1e3); }
+        if debug_timing { dump_phases(); }
         self.final_norm.forward(&h)
     }
 }
