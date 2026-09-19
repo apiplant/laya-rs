@@ -120,7 +120,7 @@ impl DecisionModel {
         let temperature_buf = vb
             .get(3, "temperature")
             .ok()
-            .map(|t: Tensor| t.to_vec1::<f32>().unwrap_or_default())
+            .map(|t: Tensor| t.to_dtype(DType::F32).and_then(|t| t.to_vec1::<f32>()).unwrap_or_default())
             .unwrap_or_else(|| vec![1.0, 1.0, 1.0]);
 
         Ok(Self {
@@ -149,13 +149,20 @@ impl DecisionModel {
         marker_mask: &Tensor,
         qtype: &Tensor,
     ) -> candle_core::Result<(Tensor, Tensor)> {
+        let debug_timing = std::env::var("LAYA_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         let h = self.encoder.forward(input_ids, attention_mask)?; // [b,s,d]
+        if debug_timing { input_ids.device().synchronize()?; }
+        if debug_timing { eprintln!("[timing] encoder.forward: {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        let t0 = std::time::Instant::now();
         let (b, _s, d) = h.dims3()?;
+        let compute_dtype = h.dtype();
+        let marker_mask = &marker_mask.to_dtype(compute_dtype)?;
 
         let type_e = self.type_emb.forward(qtype)?; // [b,d]
         let h = h.broadcast_add(&type_e.reshape((b, 1, d))?)?;
 
-        let pad_additive = build_padding_additive(attention_mask)?; // [b,1,1,s]
+        let pad_additive = build_padding_additive(attention_mask)?.to_dtype(compute_dtype)?; // [b,1,1,s]
         let mut h = h;
         for layer in &self.head_layers {
             h = layer.forward(&h, &pad_additive)?;
@@ -176,8 +183,10 @@ impl DecisionModel {
 
         // act head sees pooled CLS + a *detached* summary of the answer distribution (matches
         // `p = torch.softmax(logits.detach(), -1)` in rl_common.py — no grad through feats).
-        let logits_detached_vec = logits.detach().to_vec2::<f32>()?;
-        let marker_mask_vec = marker_mask.to_vec2::<f32>()?;
+        // Feature computation itself is host-side f32 regardless of compute_dtype (cheap, and
+        // avoids f16 precision loss in the small entropy/softmax arithmetic below).
+        let logits_detached_vec = logits.detach().to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        let marker_mask_vec = marker_mask.to_dtype(DType::F32)?.to_vec2::<f32>()?;
         let mut feats_vec = Vec::with_capacity(b * 4);
         for r in 0..b {
             let k = marker_mask_vec[r].iter().filter(|&&m| m > 0.5).count().max(2);
@@ -185,12 +194,14 @@ impl DecisionModel {
             let (top0, gap, ent) = softmax_feats(valid);
             feats_vec.extend_from_slice(&[top0, gap, ent, k as f32 / 255.0]);
         }
-        let feats = Tensor::from_vec(feats_vec, (b, 4), h.device())?;
+        let feats = Tensor::from_vec(feats_vec, (b, 4), h.device())?.to_dtype(compute_dtype)?;
         let pooled = h.narrow(1, 0, 1)?.squeeze(1)?; // [b,d], grad-enabled
         let act_in = Tensor::cat(&[&pooled, &feats], D::Minus1)?;
         let act_h = self.act_l1.forward(&act_in)?.gelu_erf()?;
         let act_logits = self.act_l2.forward(&act_h)?; // [b, n_act]
 
+        if debug_timing { input_ids.device().synchronize()?; }
+        if debug_timing { eprintln!("[timing] head+scorer+act: {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
         Ok((logits, act_logits))
     }
 
@@ -219,8 +230,8 @@ impl DecisionModel {
         let qtype_t = Tensor::from_vec(qtype.to_vec(), b, device)?;
 
         let (logits, act_logits) = self.forward_tensors(input_ids, attention_mask, &marker_pos_t, &marker_mask_t, &qtype_t)?;
-        let act_probs = candle_nn::ops::softmax_last_dim(&act_logits)?;
-        Ok((logits.to_vec2::<f32>()?, act_probs.to_vec2::<f32>()?))
+        let act_probs = candle_nn::ops::softmax_last_dim(&act_logits)?.to_dtype(DType::F32)?;
+        Ok((logits.to_dtype(DType::F32)?.to_vec2::<f32>()?, act_probs.to_vec2::<f32>()?))
     }
 }
 
@@ -245,6 +256,6 @@ fn build_padding_additive(attention_mask: &Tensor) -> candle_core::Result<Tensor
     let (b, s) = attention_mask.dims2()?;
     let m = attention_mask.to_dtype(DType::F32)?;
     let inv = ((m * -1f64)? + 1f64)?;
-    let neg_inf = (inv * f64::from(f32::MIN / 2.0))?;
+    let neg_inf = (inv * -6.0e4_f64)?;
     neg_inf.reshape((b, 1, 1, s))
 }

@@ -78,8 +78,14 @@ impl RLAgent {
 
         let device = Device::cuda_if_available(0)?;
         let n_act = cfg.act_costs.len() + 1;
+        // F16 on GPU: the checkpoint's own storage dtype, matches the original's default
+        // `torch.autocast(dtype=fp16)`, and is what actually uses the RTX 4090's tensor cores —
+        // running everything in F32 measured ~4-5x slower for no accuracy benefit (see
+        // decision_model.rs / modernbert.rs for the compute-dtype-aware mask/RoPE handling this
+        // requires). F32 on CPU, where candle's F16 kernels aren't the fast path.
+        let compute_dtype = if device.is_cuda() { DType::F16 } else { DType::F32 };
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], DType::F32, &device)?
+            VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], compute_dtype, &device)?
         };
         let model = DecisionModel::load(encoder_cfg, cfg.head_layers, n_act, vb)?;
 

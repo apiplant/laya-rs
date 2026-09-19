@@ -114,7 +114,11 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     a + b
 }
 
-fn rope_cos_sin(theta: f64, head_dim: usize, seq_len: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+/// Matches HF ModernBert's `ModernBertRotaryEmbedding.forward`: freqs/cos/sin are always
+/// computed in F32 (explicitly `torch.autocast(..., enabled=False)` there) and only cast to the
+/// model's compute dtype (`compute_dtype`, e.g. F16) at the very end, right before being
+/// multiplied against Q/K.
+fn rope_cos_sin(theta: f64, head_dim: usize, seq_len: usize, compute_dtype: DType, device: &Device) -> Result<(Tensor, Tensor)> {
     let half = head_dim / 2;
     let inv_freq: Vec<f32> = (0..half)
         .map(|i| 1f32 / (theta as f32).powf(2.0 * i as f32 / head_dim as f32))
@@ -124,8 +128,8 @@ fn rope_cos_sin(theta: f64, head_dim: usize, seq_len: usize, device: &Device) ->
     let positions = Tensor::from_vec(positions, seq_len, device)?; // [s]
     let freqs = positions.reshape((seq_len, 1))?.broadcast_mul(&inv_freq.reshape((1, half))?)?; // [s, half]
     let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?; // [s, head_dim]
-    let cos = emb.cos()?.reshape((1, 1, seq_len, head_dim))?;
-    let sin = emb.sin()?.reshape((1, 1, seq_len, head_dim))?;
+    let cos = emb.cos()?.reshape((1, 1, seq_len, head_dim))?.to_dtype(compute_dtype)?;
+    let sin = emb.sin()?.reshape((1, 1, seq_len, head_dim))?.to_dtype(compute_dtype)?;
     Ok((cos, sin))
 }
 
@@ -175,20 +179,29 @@ impl ModernBert {
 
     /// input_ids: [b, s] i64, attention_mask: [b, s] i64 (1 = real token, 0 = pad)
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+        let debug_timing = std::env::var("LAYA_TIMING").is_ok();
         let (_b, s) = input_ids.dims2()?;
         let mut h = self.tok_embeddings.forward(input_ids)?;
         h = self.emb_norm.forward(&h)?;
+        let compute_dtype = h.dtype();
 
+        let t0 = std::time::Instant::now();
         let head_dim = self.config.hidden_size / self.config.num_attention_heads;
-        let (cos_g, sin_g) = rope_cos_sin(self.config.rope_parameters.full_attention.rope_theta, head_dim, s, &self.device)?;
-        let (cos_l, sin_l) = rope_cos_sin(self.config.rope_parameters.sliding_attention.rope_theta, head_dim, s, &self.device)?;
+        let (cos_g, sin_g) = rope_cos_sin(self.config.rope_parameters.full_attention.rope_theta, head_dim, s, compute_dtype, &self.device)?;
+        let (cos_l, sin_l) = rope_cos_sin(self.config.rope_parameters.sliding_attention.rope_theta, head_dim, s, compute_dtype, &self.device)?;
 
-        let pad_mask = build_padding_mask(attention_mask)?; // [b,1,1,s] additive
+        // Masks are built in F32 (safe arithmetic for the -1e30-ish sentinel) then cast to the
+        // compute dtype right before use, same "compute in F32, cast at the boundary" pattern as
+        // the RoPE tables above.
+        let pad_mask = build_padding_mask(attention_mask)?.to_dtype(compute_dtype)?; // [b,1,1,s] additive
         let local_window = self.config.local_attention / 2;
-        let sliding_mask = build_sliding_mask(s, local_window, &self.device)?; // [1,1,s,s] additive
-        let global_mask = pad_mask.broadcast_add(&Tensor::zeros((1, 1, s, s), DType::F32, &self.device)?)?;
+        let sliding_mask = build_sliding_mask(s, local_window, &self.device)?.to_dtype(compute_dtype)?; // [1,1,s,s] additive
+        let global_mask = pad_mask.broadcast_add(&Tensor::zeros((1, 1, s, s), compute_dtype, &self.device)?)?;
         let local_mask = pad_mask.broadcast_add(&sliding_mask)?;
+        if debug_timing { self.device.synchronize()?; }
+        if debug_timing { eprintln!("[timing]   rope+mask build (s={s}): {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
 
+        let t0 = std::time::Instant::now();
         for layer in &self.layers {
             let residual = h.clone();
             let normed = match &layer.attn_norm {
@@ -208,6 +221,8 @@ impl ModernBert {
             let mlp_out = layer.mlp.forward(&normed)?;
             h = (residual + mlp_out)?;
         }
+        if debug_timing { self.device.synchronize()?; }
+        if debug_timing { eprintln!("[timing]   {} layers: {:.2}ms", self.layers.len(), t0.elapsed().as_secs_f64() * 1e3); }
         self.final_norm.forward(&h)
     }
 }
@@ -217,7 +232,7 @@ fn build_padding_mask(attention_mask: &Tensor) -> Result<Tensor> {
     let (b, s) = attention_mask.dims2()?;
     let m = attention_mask.to_dtype(DType::F32)?;
     let inv = ((m * -1f64)? + 1f64)?; // 1 where pad
-    let neg_inf = (inv * f64::from(f32::MIN / 2.0))?;
+    let neg_inf = (inv * -6.0e4_f64)?;
     neg_inf.reshape((b, 1, 1, s))
 }
 
@@ -227,7 +242,7 @@ fn build_sliding_mask(seq_len: usize, window: usize, device: &Device) -> Result<
         for j in 0..seq_len {
             let diff = if i > j { i - j } else { j - i };
             if diff > window {
-                data[i * seq_len + j] = f32::MIN / 2.0;
+                data[i * seq_len + j] = -6.0e4;
             }
         }
     }
