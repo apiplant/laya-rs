@@ -130,10 +130,14 @@ function loadFromFiles(bytes: Record<string, Uint8Array>, wasm: WasmExports): Wa
 }
 
 /** A local mirror of one or more checkpoints, picked once as a single parent
- * directory: `<root>/<hf-repo-basename>/model.safetensors`,
- * `.../tokenizer/tokenizer.json`, etc — one subdirectory per checkpoint,
- * named after the last segment of its Hugging Face repo id
- * (`convaiinnovations/laya-typed-decisions` -> `laya-typed-decisions`).
+ * directory. Two layouts are recognized, since laya ships checkpoints both
+ * ways: a directory of individually-cloned standalone repos
+ * (`<root>/laya-typed-decisions/model.safetensors`, one subdirectory per
+ * checkpoint named after its repo's basename) or a single clone of the
+ * `convaiinnovations/laya` hub repo, whose own `typed-decisions`/
+ * `multilingual` subfolders serve the same purpose (`<root>/` here being
+ * that clone itself — e.g. `~/laya`, the same layout the CLI's own
+ * `models_root` argument expects). See [`localDirCandidates`].
  *
  * Held as a [File System Access API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_API)
  * directory handle rather than an uploaded file list: picking it never
@@ -149,11 +153,18 @@ function hfRepoBasename(hfRepo: string): string {
   return hfRepo.split("/").pop() ?? hfRepo;
 }
 
-/** Which of `models` (by Hugging Face repo basename) are present in a
- * local library, in `models` order. */
+/** The subdirectory names that would hold `def`'s files directly under a
+ * picked library root, in preference order: the standalone repo's own
+ * basename first, then the shared hub repo's subfolder name. */
+function localDirCandidates(def: ModelDef): string[] {
+  return [hfRepoBasename(def.hfRepo), def.subfolder];
+}
+
+/** Which of `models` are present in a local library under either recognized
+ * name (see [`localDirCandidates`]), in `models` order. */
 export function availableLocally(library: LocalLibrary, models: ModelDef[]): ModelDef[] {
   const names = new Set(library.checkpointNames);
-  return models.filter((m) => names.has(hfRepoBasename(m.hfRepo)));
+  return models.filter((m) => localDirCandidates(m).some((name) => names.has(name)));
 }
 
 /** Loads one checkpoint from a local library directory — no network
@@ -165,7 +176,9 @@ export async function loadModelFromHandle(
   onProgress?: (p: DownloadProgress) => void,
 ): Promise<LoadedModel> {
   const wasm = await loadWasm();
-  const checkpointDir = await getSubdirectory(library.handle, hfRepoBasename(def.hfRepo));
+  const candidates = localDirCandidates(def);
+  const dirName = candidates.find((name) => library.checkpointNames.includes(name)) ?? candidates[0];
+  const checkpointDir = await getSubdirectory(library.handle, dirName);
   const bytes: Record<string, Uint8Array> = {};
   for (let i = 0; i < CHECKPOINT_FILES.length; i++) {
     const name = CHECKPOINT_FILES[i];
@@ -350,7 +363,7 @@ export async function selectModel(def: ModelDef, onProgress?: (p: DownloadProgre
 export async function selectLocalModel(def: ModelDef, onProgress?: (p: DownloadProgress) => void): Promise<LoadedModel> {
   const library = localLibrary();
   if (!library) throw new Error("no local library directory selected");
-  if (!library.checkpointNames.includes(hfRepoBasename(def.hfRepo))) {
+  if (!localDirCandidates(def).some((name) => library.checkpointNames.includes(name))) {
     throw new Error(`${def.label} not found in ${library.rootName}`);
   }
   writePersisted({ source: "local", localRootName: library.rootName, localModelKey: def.key });

@@ -112,10 +112,11 @@ export function ModelPicker(props: { models: ModelDef[]; onLoaded: (m: LoadedMod
       const library = await selectLocalLibrary();
       if (!library) return; // user dismissed the picker
       if (availableLocally(library, props.models).length === 0) {
+        const names = props.models.flatMap((m) => [m.hfRepo.split("/").pop()!, m.subfolder]);
         setError(
-          `No matching checkpoints found in ${library.rootName}. Expected a subdirectory named after one of: ${props.models
-            .map((m) => m.hfRepo.split("/").pop())
-            .join(", ")}.`,
+          `No matching checkpoints found in ${library.rootName}. Expected a subdirectory named after one of: ${Array.from(
+            new Set(names),
+          ).join(", ")}.`,
         );
       }
     } catch (e) {
@@ -262,9 +263,15 @@ export function ModelPicker(props: { models: ModelDef[]; onLoaded: (m: LoadedMod
                   when={pendingLibrary()}
                   fallback={
                     <p class="text-sm text-muted">
-                      Pick a directory containing one subdirectory per checkpoint, each named
-                      after its Hugging Face repo (e.g.{" "}
-                      <code class="font-mono text-xs">laya-typed-decisions</code>), holding{" "}
+                      Pick a directory with one subdirectory per checkpoint — either a folder of
+                      individually-cloned repos (e.g.{" "}
+                      <code class="font-mono text-xs">laya-typed-decisions/</code>) or a single
+                      clone of the <code class="font-mono text-xs">convaiinnovations/laya</code>{" "}
+                      family repo itself (same layout the CLI's <code class="font-mono text-xs">models_root</code>{" "}
+                      expects, e.g. <code class="font-mono text-xs">~/laya</code> with its own{" "}
+                      <code class="font-mono text-xs">typed-decisions/</code>/
+                      <code class="font-mono text-xs">multilingual/</code> subfolders). Each
+                      checkpoint directory should hold{" "}
                       <code class="font-mono text-xs">rl_agent_config.json</code>,{" "}
                       <code class="font-mono text-xs">encoder/config.json</code>,{" "}
                       <code class="font-mono text-xs">tokenizer/tokenizer.json</code>,{" "}
