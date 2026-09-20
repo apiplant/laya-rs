@@ -62,21 +62,27 @@ gist above):
 
 | build | fixture total |
 |---|---|
-| `--features cuda` | 369 ms |
-| `--features flash-attn` | **178 ms** |
+| `--features cuda` | 349 ms |
+| `--features flash-attn` | **135 ms** |
 | *reference: the original Python implementation, same GPU* | *165 ms* |
 | *reference: the jev API this is benchmarked against* | *441 ms* |
 
+On the isolated forward pass at an identical `b=7, s=1024` batch, this port is 60.3 ms against
+PyTorch's 63.1 ms (`examples/bench_fwd.rs` mirrors a PyTorch script for a like-for-like number).
+
 Getting there was mostly about finding places where candle silently takes a slow path, which
 `examples/bench_ops.rs` (per-op micro-benchmarks at the real layer shapes) and
-`examples/bench_fwd.rs` (whole-forward, mirrors a PyTorch script for like-for-like comparison)
-exist to surface:
+`examples/bench_fwd.rs` exist to surface:
 
 - `LayerNorm` only uses its fused CUDA kernel when a bias is present. ModernBERT's norms are
   bias-free, so they were taking an ~8-op fallback that upcasts to F32 — 18x slower than the
-  memory traffic justifies. Passing an explicit zero bias fixes it.
+  memory traffic justifies (37.1 ms → 3.7 ms). Passing an explicit zero bias fixes it.
 - `Linear` on a rank-3 input issues a *batched* GEMM instead of one large flattened GEMM (2.3x
   on the model's biggest matmul).
+- RoPE and GeGLU were chains of 6 and 3 separate elementwise ops, each a full round trip through
+  a 14.7 MB tensor, running several times over their bandwidth bound. `src/fused.rs` replaces
+  each with one NVRTC-compiled CUDA kernel (22.8 ms → 2.3 ms and 15.5 ms → 4.4 ms), checked
+  against the op chains they replace by unit tests.
 - Scaling Q before the QK^T matmul rather than scaling the S×S scores after (~16x fewer
   elementwise ops, since `head_dim` << `seq_len`).
 - Unpadding once for the whole encoder instead of gathering/scattering per layer.
