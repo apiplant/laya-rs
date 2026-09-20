@@ -1,3 +1,10 @@
+# Not a real monorepo — this file exists solely to allow-list the two
+# postinstall scripts below. Some pnpm versions require a non-empty
+# `packages` field on any pnpm-workspace.yaml, even a settings-only one
+# ("packages field missing or empty"), so it's declared explicitly as just
+# this one package.
+packages:
+  - "."
 allowBuilds:
   esbuild: true
   workerd: true

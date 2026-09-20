@@ -358,20 +358,26 @@ export function QuestionBuilder(props: {
   const [importText, setImportText] = createSignal("");
   const [importError, setImportError] = createSignal<string | null>(null);
 
-  // No `on`-style explicit-dependency helper in this Solid version — track
-  // the last-applied preset by reference so a new one (a fresh object from
-  // "load preset") is picked up exactly once, without re-running every time
-  // `cards` itself changes (this effect only reads `props.preset()`).
-  let lastPreset: QuestionSet | null = null;
-  createEffect(() => {
-    const preset = props.preset();
-    if (preset && preset !== lastPreset) {
-      lastPreset = preset;
-      setCards(rawToCards(preset));
-    }
-  });
+  // This Solid version requires createEffect(computeFn, effectFn): the
+  // compute function is what's tracked, and the effect function only runs
+  // when its return value actually changes — exactly the "new preset
+  // object, load it once" behavior wanted here, with no manual bookkeeping.
+  createEffect(
+    () => props.preset(),
+    (preset) => {
+      if (preset) setCards(rawToCards(preset));
+    },
+  );
 
-  createEffect(() => props.onChange(serialize(cards())));
+  createEffect(
+    () => serialize(cards()),
+    (qs) => {
+      // Braced body: an effect function may only return undefined or an
+      // actual cleanup function, and onChange's return value (whatever the
+      // caller's setter happens to hand back) isn't either.
+      props.onChange(qs);
+    },
+  );
 
   function addCard() {
     setCards([...cards(), emptyCard(`question_${cards().length + 1}`)]);
