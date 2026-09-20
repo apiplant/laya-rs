@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod batching;
 pub mod decision_model;
+pub mod fused;
 pub mod metrics;
 pub mod modernbert;
 pub mod router;

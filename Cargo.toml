@@ -28,6 +28,7 @@ rand = "0.8"
 rand_distr = "0.4"
 lingua = "1.8.0"
 candle-flash-attn = { version = "0.9", optional = true }
+half = "2"
 
 [profile.release]
 opt-level = 3

@@ -114,12 +114,15 @@ impl MlpGeglu {
         record_phase(debug_timing, x.device(), "mlp.wi", t0)?;
 
         let t0 = std::time::Instant::now();
-        let last = x.dim(D::Minus1)?;
-        let half = last / 2;
-        let gate = x.narrow(D::Minus1, 0, half)?;
-        let up = x.narrow(D::Minus1, half, half)?;
-        let gate = gate.gelu_erf()?;
-        let gated = (gate * up)?;
+        let gated = if crate::fused::usable(&x) {
+            crate::fused::geglu(&x)?
+        } else {
+            let last = x.dim(D::Minus1)?;
+            let half = last / 2;
+            let gate = x.narrow(D::Minus1, 0, half)?.gelu_erf()?;
+            let up = x.narrow(D::Minus1, half, half)?;
+            (gate * up)?
+        };
         record_phase(debug_timing, gated.device(), "mlp.gelu_gate", t0)?;
 
         let t0 = std::time::Instant::now();
@@ -230,10 +233,18 @@ impl Attention {
             let v = qkv.narrow(2, 2, 1)?.squeeze(2)?;
             // cos/sin arrive as [1,1,s,d] for the naive layout; same memory reinterpreted as
             // [1,s,1,d] broadcasts correctly over [b,s,h,d].
-            let cos = cos.reshape((1, s, 1, self.head_dim))?;
-            let sin = sin.reshape((1, s, 1, self.head_dim))?;
-            let q = apply_rope(&q, &cos, &sin)?;
-            let k = apply_rope(&k, &cos, &sin)?;
+            let (q, k) = if crate::fused::usable(&qkv) {
+                let cos2 = cos.reshape((s, self.head_dim))?;
+                let sin2 = sin.reshape((s, self.head_dim))?;
+                (
+                    crate::fused::rope(&q.contiguous()?, &cos2, &sin2)?,
+                    crate::fused::rope(&k.contiguous()?, &cos2, &sin2)?,
+                )
+            } else {
+                let cos = cos.reshape((1, s, 1, self.head_dim))?;
+                let sin = sin.reshape((1, s, 1, self.head_dim))?;
+                (apply_rope(&q, &cos, &sin)?, apply_rope(&k, &cos, &sin)?)
+            };
             record_phase(debug_timing, x.device(), "attn.split+rope", t0)?;
 
             let t0 = std::time::Instant::now();

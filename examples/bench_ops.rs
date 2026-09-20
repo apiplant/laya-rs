@@ -27,14 +27,15 @@ fn main() -> anyhow::Result<()> {
     let qh = Tensor::randn(0f32, 1f32, (b, s, nh, hd), &dev)?.to_dtype(f16)?;
     let cos = Tensor::randn(0f32, 1f32, (1, s, 1, hd), &dev)?.to_dtype(f16)?;
     let lnw = Tensor::randn(0f32, 1f32, h, &dev)?.to_dtype(f16)?;
-    let ln = candle_nn::LayerNorm::new_no_bias(lnw, 1e-5);
+    let lnb = Tensor::zeros(h, f16, &dev)?;
+    let ln = candle_nn::LayerNorm::new(lnw, lnb, 1e-5);
     use candle_nn::Module;
 
     let mut total = 0.0;
-    total += bench("gemm wqkv [7168,1024]x3072", &dev, 28.0, || { x.broadcast_matmul(&w_qkv.t()?)?; Ok(()) })?;
-    total += bench("gemm attn.wo 1024x1024", &dev, 28.0, || { x.broadcast_matmul(&w_o.t()?)?; Ok(()) })?;
-    total += bench("gemm mlp.wi 1024x5248", &dev, 28.0, || { x.broadcast_matmul(&w_i.t()?)?; Ok(()) })?;
-    total += bench("gemm mlp.wo 2624x1024", &dev, 28.0, || { x_ff.broadcast_matmul(&w_wo.t()?)?; Ok(()) })?;
+    total += bench("gemm wqkv [7168,1024]x3072", &dev, 28.0, || { x.reshape((b*s, h))?.matmul(&w_qkv.t()?)?; Ok(()) })?;
+    total += bench("gemm attn.wo 1024x1024", &dev, 28.0, || { x.reshape((b*s, h))?.matmul(&w_o.t()?)?; Ok(()) })?;
+    total += bench("gemm mlp.wi 1024x5248", &dev, 28.0, || { x.reshape((b*s, h))?.matmul(&w_i.t()?)?; Ok(()) })?;
+    total += bench("gemm mlp.wo 2624x1024", &dev, 28.0, || { x_ff.reshape((b*s, 2624))?.matmul(&w_wo.t()?)?; Ok(()) })?;
     total += bench("flash global", &dev, 10.0, || {
         candle_flash_attn::flash_attn_windowed(&qh, &qh, &qh, 0.125, None, None)?; Ok(()) })?;
     total += bench("flash local(64)", &dev, 18.0, || {
@@ -55,6 +56,17 @@ fn main() -> anyhow::Result<()> {
         let u = qkv_big.narrow(D::Minus1, 2624, 2624)?;
         let _ = (g.gelu_erf()? * u)?; Ok(()) })?;
     total += bench("residual add", &dev, 56.0, || { (&x + &x)?; Ok(()) })?;
-    println!("\n{:<28} {:>28} {total:7.2} ms", "SUM of isolated ops", "");
+    println!("\n{:<28} {:>28} {total:7.2} ms", "SUM (unfused reference)", "");
+
+    println!("\nfused kernels (src/fused.rs) replacing the two rows above:");
+    let cos2 = cos.reshape((s, hd))?;
+    let sin2 = cos2.clone();
+    let mut fused_total = 0.0;
+    fused_total += bench("  rope fused (q+k)", &dev, 28.0, || {
+        laya::fused::rope(&qh, &cos2, &sin2)?;
+        laya::fused::rope(&qh, &cos2, &sin2)?;
+        Ok(()) })?;
+    fused_total += bench("  geglu fused", &dev, 28.0, || { laya::fused::geglu(&qkv_big)?; Ok(()) })?;
+    println!("{:<28} {:>28} {fused_total:7.2} ms  (was {:.2} ms)", "  subtotal", "", 22.79 + 15.53);
     Ok(())
 }
