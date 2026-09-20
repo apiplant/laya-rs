@@ -125,7 +125,7 @@ impl RLAgent {
 
     pub fn system_one(&self, state: &Value, questions: &[(String, Question)]) -> anyhow::Result<Vec<(String, Answer)>> {
         let debug_timing = std::env::var("LAYA_TIMING").is_ok();
-        let t_tok = std::time::Instant::now();
+        let t_tok = crate::timing::Instant::now();
         let mut all_ids = Vec::with_capacity(questions.len());
         let mut all_markers = Vec::with_capacity(questions.len());
         let mut qtypes = Vec::with_capacity(questions.len());

@@ -186,11 +186,11 @@ impl DecisionModel {
         qtype: &Tensor,
     ) -> candle_core::Result<(Tensor, Tensor)> {
         let debug_timing = std::env::var("LAYA_TIMING").is_ok();
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let h = self.encoder.forward(input_ids, attention_mask)?; // [b,s,d]
         if debug_timing { input_ids.device().synchronize()?; }
         if debug_timing { eprintln!("[timing] encoder.forward: {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let (b, _s, d) = h.dims3()?;
         let compute_dtype = h.dtype();
         let marker_mask = &marker_mask.to_dtype(compute_dtype)?;

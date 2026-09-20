@@ -8,6 +8,7 @@ pub mod modernbert;
 pub mod router;
 pub mod safetensors32;
 pub mod schema;
+pub mod timing;
 pub mod train;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;

@@ -14,7 +14,7 @@ thread_local! {
 /// Adds `dur` to the running total for `phase`, only when `LAYA_TIMING=1` (checked once by the
 /// caller and passed in, so this stays a no-op branch in the hot path otherwise). Synchronizes
 /// the device first so the measured duration reflects actual GPU compute, not just dispatch.
-fn record_phase(debug_timing: bool, device: &Device, phase: &'static str, t0: std::time::Instant) -> Result<()> {
+fn record_phase(debug_timing: bool, device: &Device, phase: &'static str, t0: crate::timing::Instant) -> Result<()> {
     if !debug_timing {
         return Ok(());
     }
@@ -109,11 +109,11 @@ impl MlpGeglu {
     }
 
     fn forward(&self, x: &Tensor, debug_timing: bool) -> Result<Tensor> {
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let x = linear_flat(&self.wi, x)?;
         record_phase(debug_timing, x.device(), "mlp.wi", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let gated = if crate::fused::usable(&x) {
             crate::fused::geglu(&x)?
         } else {
@@ -125,7 +125,7 @@ impl MlpGeglu {
         };
         record_phase(debug_timing, gated.device(), "mlp.gelu_gate", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let out = linear_flat(&self.wo, &gated)?;
         record_phase(debug_timing, out.device(), "mlp.wo", t0)?;
         Ok(out)
@@ -216,14 +216,14 @@ impl Attention {
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, mode: &AttnMode, debug_timing: bool) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let qkv = linear_flat(&self.wqkv, x)?; // [b, s, 3*hidden]
         record_phase(debug_timing, x.device(), "attn.wqkv", t0)?;
         let qkv = qkv.reshape((b, s, 3, self.n_heads, self.head_dim))?;
 
         #[cfg(feature = "flash-attn")]
         if let AttnMode::Flash { window, pack } = mode {
-            let t0 = std::time::Instant::now();
+            let t0 = crate::timing::Instant::now();
             // Stay in [b,s,h,d] the whole way: flash-attn reads per-dimension strides and only
             // requires the *last* dim to be contiguous, so these narrow+squeeze views need no
             // copy at all (the naive path below has to transpose to [b,h,s,d] and materialize
@@ -247,7 +247,7 @@ impl Attention {
             };
             record_phase(debug_timing, x.device(), "attn.split+rope", t0)?;
 
-            let t0 = std::time::Instant::now();
+            let t0 = crate::timing::Instant::now();
             let scale = 1f32 / (self.head_dim as f32).sqrt();
             let hd = self.n_heads * self.head_dim;
             let out = match pack {
@@ -271,19 +271,19 @@ impl Attention {
             let out = out.reshape((b, s, hd))?;
             record_phase(debug_timing, x.device(), "attn.flash", t0)?;
 
-            let t0 = std::time::Instant::now();
+            let t0 = crate::timing::Instant::now();
             let out = linear_flat(&self.wo, &out)?;
             record_phase(debug_timing, x.device(), "attn.wo", t0)?;
             return Ok(out);
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?; // [b,h,s,d]
         let k = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
         let v = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
         record_phase(debug_timing, x.device(), "attn.split", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
         record_phase(debug_timing, x.device(), "attn.rope", t0)?;
@@ -291,25 +291,25 @@ impl Attention {
         // Scale Q (touches b*h*s*d elements) instead of the post-matmul attention scores (b*h*s*s
         // elements) — s >> d here (1024 vs 64), so this is ~16x fewer elementwise ops for the
         // same result (softmax is scale-invariant to *where* the constant factor is applied).
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let q = (q * (1f64 / (self.head_dim as f64).sqrt()))?;
         let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?; // [b,h,s,s]
         record_phase(debug_timing, x.device(), "attn.qk_matmul", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let attn = attn.broadcast_add(mask)?;
         let attn = candle_nn::ops::softmax_last_dim(&attn)?;
         record_phase(debug_timing, x.device(), "attn.mask_softmax", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let out = attn.matmul(&v)?; // [b,h,s,d]
         record_phase(debug_timing, x.device(), "attn.av_matmul", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, self.n_heads * self.head_dim))?;
         record_phase(debug_timing, x.device(), "attn.merge", t0)?;
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let out = linear_flat(&self.wo, &out)?;
         record_phase(debug_timing, x.device(), "attn.wo", t0)?;
         Ok(out)
@@ -402,7 +402,7 @@ impl ModernBert {
         h = self.emb_norm.forward(&h)?;
         let compute_dtype = h.dtype();
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         let head_dim = self.config.hidden_size / self.config.num_attention_heads;
         let (cos_g, sin_g) = rope_cos_sin(self.config.rope_parameters.full_attention.rope_theta, head_dim, s, compute_dtype, &self.device)?;
         let (cos_l, sin_l) = rope_cos_sin(self.config.rope_parameters.sliding_attention.rope_theta, head_dim, s, compute_dtype, &self.device)?;
@@ -458,7 +458,7 @@ impl ModernBert {
             h = h.reshape((b * s, hidden))?.index_select(&p.indices, 0)?.reshape((1, p.total_tokens, hidden))?;
         }
 
-        let t0 = std::time::Instant::now();
+        let t0 = crate::timing::Instant::now();
         for layer in &self.layers {
             let residual = h.clone();
             let normed = match &layer.attn_norm {
