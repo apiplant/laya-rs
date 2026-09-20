@@ -13,11 +13,21 @@
 //! NVRTC on first use and cached on the device, so there's no build-time CUDA dependency (unlike
 //! the `flash-attn` feature) — this module is part of the plain `cuda` build.
 
+#[cfg(feature = "cuda")]
 use candle_core::backend::BackendStorage;
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+#[cfg(feature = "cuda")]
 use candle_core::cuda_backend::WrapErr;
+// Always available: candle-core re-exports a dummy `CudaStorage`/`CudaDevice` pair without the
+// `cuda` feature (see its `dummy_cuda_backend`), just without the methods `cuda_fwd` below needs
+// — those calls are what's actually gated, not the type itself.
 use candle_core::{CpuStorage, CudaStorage, DType, Layout, Result, Shape, Tensor};
 
+// The kernel source and its NVRTC compilation are only reachable through `cuda_fwd` below, which
+// only exists with the `cuda` feature — `candle_core::cuda_backend` itself doesn't exist without
+// it, so this whole block has to be gated rather than just the call sites.
+#[cfg(feature = "cuda")]
 const KERNELS: &str = r#"
 #include <cuda_fp16.h>
 
@@ -58,6 +68,7 @@ extern "C" __global__ void geglu_f16(
 }
 "#;
 
+#[cfg(feature = "cuda")]
 fn ptx() -> &'static str {
     use candle_core::cuda_backend::cudarc::nvrtc::safe::{compile_ptx_with_opts, CompileOptions};
     use std::sync::OnceLock;
@@ -93,6 +104,17 @@ impl candle_core::CustomOp3 for RopeOp {
         candle_core::bail!("laya-rope: cuda only")
     }
 
+    #[cfg(not(feature = "cuda"))]
+    fn cuda_fwd(
+        &self,
+        _x: &CudaStorage, _xl: &Layout,
+        _cos: &CudaStorage, _cl: &Layout,
+        _sin: &CudaStorage, _sl: &Layout,
+    ) -> Result<(CudaStorage, Shape)> {
+        candle_core::bail!("laya-rope: built without the `cuda` feature")
+    }
+
+    #[cfg(feature = "cuda")]
     fn cuda_fwd(
         &self,
         x: &CudaStorage, xl: &Layout,
@@ -142,6 +164,12 @@ impl candle_core::CustomOp1 for GegluOp {
         candle_core::bail!("laya-geglu: cuda only")
     }
 
+    #[cfg(not(feature = "cuda"))]
+    fn cuda_fwd(&self, _x: &CudaStorage, _xl: &Layout) -> Result<(CudaStorage, Shape)> {
+        candle_core::bail!("laya-geglu: built without the `cuda` feature")
+    }
+
+    #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout) -> Result<(CudaStorage, Shape)> {
         let dev = x.device().clone();
         let dims = xl.shape().dims();

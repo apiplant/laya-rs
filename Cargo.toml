@@ -1,8 +1,14 @@
 [package]
-name = "laya"
+name = "laya-rs"
 version = "0.1.0"
 edition = "2021"
 default-run = "laya"
+description = "Rust (candle) inference for Laya's typed-decision (choice/score/noul) decision engine"
+license = "Apache-2.0"
+repository = "https://github.com/apiplant/laya-rs"
+readme = "README.md"
+keywords = ["laya", "candle", "inference", "nlp", "rl"]
+categories = ["science", "text-processing", "command-line-utilities"]
 
 [[bin]]
 name = "laya"
@@ -11,6 +17,7 @@ path = "src/main.rs"
 [lib]
 name = "laya"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
@@ -19,16 +26,42 @@ flash-attn = ["cuda", "dep:candle-flash-attn"]
 [dependencies]
 candle-core = "0.9"
 candle-nn = "0.9"
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rand_distr = "0.4"
-lingua = "1.8.0"
 candle-flash-attn = { version = "0.9", optional = true }
 half = "2"
+# `onig` (this version's default regex backend for the `Split` pre-tokenizer
+# pattern) links a C library (Oniguruma) and cannot target
+# wasm32-unknown-unknown. Cargo unions a dependency's features across every
+# target it could possibly be built for rather than resolving them per-target
+# on stable, so `onig` for native + a wasm-only backend for wasm can't coexist
+# as a target-gated split of the same dependency — confirmed by trying it (the
+# wasm32 build still pulled in and failed to link `onig`). `unstable_wasm`
+# (this crate's actual feature name for the pure-Rust `fancy-regex` backend,
+# despite the name — it's not gated to wasm builds, just introduced for them)
+# is used for every target instead, matching what gliner-rs does with its own
+# (newer) tokenizers version, which ships this way in production for both its
+# CLI and its wasm build.
+tokenizers = { version = "0.20", default-features = false, features = ["unstable_wasm"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Real statistical language-ID, used by `router` to pick english vs multilingual
+# checkpoints. Not needed in the browser demo (the model picker chooses the
+# checkpoint directly) and its wasm32 compatibility is unverified, so it's
+# native-only.
+lingua = "1.8.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 [profile.release]
 opt-level = 3

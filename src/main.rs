@@ -3,11 +3,17 @@ use std::collections::BTreeMap;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
+use laya::agent::answer_to_json;
 use laya::batching::raw_question_to_question;
-use laya::{route, Answer, Checkpoint, QType, Question, RLAgent, RlcdConfig, Trainer};
+use laya::{route, Checkpoint, QType, Question, RLAgent, RlcdConfig, Trainer};
 
 /// Rust reimplementation of Laya's typed-decision inference + RLCD training.
+// clap derives the app name from `CARGO_PKG_NAME` by default, which is the
+// crate/package name `laya-rs` — pinned explicitly so `laya --version` keeps
+// reporting the binary name, not the package name. `version` isn't added
+// automatically without clap's `cargo` feature, so it's spelled out too.
 #[derive(Parser)]
+#[command(name = "laya", version)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -128,19 +134,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{section}: {} questions in {elapsed_ms:.2} ms ({:.2} ms/question)", questions.len(), elapsed_ms / questions.len() as f64);
             let mut section_out = BTreeMap::new();
             for (qid, answer) in answers {
-                let v = match answer {
-                    Answer::Choice { choice, probabilities, confidence, act_probability } => json!({
-                        "type": "choice", "choice": choice, "confidence": confidence, "act_probability": act_probability,
-                        "probabilities": probabilities.into_iter().collect::<BTreeMap<_, _>>(),
-                    }),
-                    Answer::Score { score, legend, probabilities, confidence, act_probability } => json!({
-                        "type": "score", "score": score, "confidence": confidence, "act_probability": act_probability,
-                        "legend": legend.iter().enumerate().map(|(i, c)| (i.to_string(), c.clone())).collect::<BTreeMap<_, _>>(),
-                        "probabilities": probabilities.iter().enumerate().map(|(i, p)| (i.to_string(), *p)).collect::<BTreeMap<_, _>>(),
-                    }),
-                    Answer::Noul { noul, act_probability } => json!({ "type": "noul", "noul": noul, "act_probability": act_probability }),
-                };
-                section_out.insert(qid, v);
+                section_out.insert(qid, answer_to_json(answer));
             }
             out.insert(section.clone(), section_out);
         }

@@ -1,0 +1,14 @@
+Package: laya-rs
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/laya-rs
+Description: Rust (candle) inference for Laya's typed-decision engine
+ laya answers typed choice/score/noul questions over an arbitrary state
+ (text, email, ticket, or JSON) in a single non-autoregressive forward pass
+ through a ModernBERT/mmBERT encoder plus a from-scratch decision head — no
+ text generation, calibrated probabilities out. Point it at a local
+ convaiinnovations/laya checkpoint directory; weights are not bundled.

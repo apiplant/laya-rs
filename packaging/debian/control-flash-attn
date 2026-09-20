@@ -1,0 +1,23 @@
+Package: laya-rs-flash-attn
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Depends: libcuda1
+Conflicts: laya-rs
+Replaces: laya-rs
+Provides: laya-rs
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/laya-rs
+Description: Rust (candle) inference for Laya's typed-decision engine (CUDA + flash-attn build)
+ laya answers typed choice/score/noul questions over an arbitrary state
+ (text, email, ticket, or JSON) in a single non-autoregressive forward pass
+ through a ModernBERT/mmBERT encoder plus a from-scratch decision head. This
+ build is linked against CUDA and additionally runs the encoder and decision
+ head's attention through a fused flash-attention kernel over an unpadded
+ (varlen) sequence layout. Needs an NVIDIA GPU with a host driver compatible
+ with the CUDA toolkit version it was built against (see
+ https://github.com/apiplant/laya-rs/blob/main/packaging/README.md).
+ libcuda1 (installed by the NVIDIA driver package) satisfies the runtime
+ link; it does not by itself guarantee driver/toolkit compatibility.

@@ -1,0 +1,141 @@
+@import "tailwindcss";
+
+/*
+ * Variables only. Everything visual is a Tailwind utility in the components.
+ *
+ * The names are semantic (canvas/surface/line/ink) so components never mention
+ * a theme; `:root.light` swaps the values underneath and every utility follows,
+ * because Tailwind v4 emits `var(--color-*)` rather than literals.
+ */
+@theme {
+  /* dark — the site's default */
+  --color-canvas: #171a21;
+  --color-surface: #1e2129;
+  --color-surface-2: #262a33;
+  --color-surface-3: #2f343f;
+  --color-line: #30363d;
+  --color-line-strong: #3d444d;
+  --color-ink: #ffffff;
+  --color-muted: #c9d1d9;
+  --color-faint: #8b949e;
+  --color-accent: #4a9eff;
+  --color-accent-dim: #2b7de9;
+  --color-on-accent: #08182c;
+  --color-accent-soft: #16273c;
+  --color-accent-line: #274d75;
+  --color-danger: #f87171;
+  --color-warn: #facc15;
+  --color-success: #4ade80;
+  --color-code-bg: #12151b;
+
+  --font-sans: "Open Sans", Helvetica, Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+/* The one typo-proof way to keep two palettes in sync is to list them
+   together; anything not repeated here is shared. */
+:root.light {
+  --color-canvas: #f2f5fa;
+  --color-surface: #ffffff;
+  --color-surface-2: #e8ecf1;
+  --color-surface-3: #dde3ea;
+  --color-line: #d0d7de;
+  --color-line-strong: #b7c0ca;
+  --color-ink: #1f2328;
+  --color-muted: #424a53;
+  --color-faint: #57606a;
+  --color-accent: #2b7de9;
+  --color-accent-dim: #1c62be;
+  --color-on-accent: #ffffff;
+  --color-accent-soft: #e3eefc;
+  --color-accent-line: #b6d3f7;
+  --color-danger: #cf222e;
+  --color-warn: #9a6700;
+  --color-success: #1a7f37;
+  --color-code-bg: #ffffff;
+}
+
+/* Two rules that no utility can express, and nothing else. */
+
+/* 1. The document element: page background and anchor offset under the sticky
+      header, both of which have to sit on <html>/<body> themselves. */
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 5.5rem;
+  background-color: var(--color-canvas);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* 2. Prism token colors. Prism ships its own themes as literal hex values;
+      instead we map its token classes onto the site's own semantic
+      variables, so highlighted code follows light/dark like everything
+      else and never fights the surrounding palette. */
+code[class*="language-"] {
+  color: var(--color-muted);
+}
+
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: var(--color-faint);
+  font-style: italic;
+}
+
+.token.punctuation {
+  color: var(--color-faint);
+}
+
+.token.keyword,
+.token.important,
+.token.atrule {
+  color: var(--color-accent);
+}
+
+.token.string,
+.token.char {
+  color: var(--color-success);
+}
+
+.token.function,
+.token.class-name {
+  color: var(--color-ink);
+}
+
+.token.number,
+.token.boolean,
+.token.constant {
+  color: var(--color-warn);
+}
+
+.token.operator,
+.token.entity,
+.token.url {
+  color: var(--color-muted);
+}
+
+.token.property,
+.token.attr-name,
+.token.builtin {
+  color: var(--color-ink);
+}
+
+.token.lifetime,
+.token.attribute {
+  color: var(--color-accent);
+}
+
+.token.macro {
+  color: var(--color-warn);
+}
+
+.token.regex,
+.token.variable {
+  color: var(--color-danger);
+}

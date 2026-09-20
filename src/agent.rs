@@ -1,13 +1,13 @@
 //! Port of `rl_agent_api.RLAgent`: loads a checkpoint directory (rl_agent_config.json,
 //! tokenizer/, encoder/config.json, model.safetensors) and answers typed questions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokenizers::Tokenizer;
 
 use crate::batching::temp_bucket;
@@ -87,6 +87,37 @@ impl RLAgent {
         let vb = unsafe {
             VarBuilder::from_mmaped_safetensors(&[dir.join("model.safetensors")], compute_dtype, &device)?
         };
+        let model = DecisionModel::load(encoder_cfg, cfg.head_layers, n_act, vb)?;
+
+        Ok(Self { tok, special, model, cfg, device })
+    }
+
+    /// Same as [`Self::load`] but from in-memory file contents (used by the wasm bindings —
+    /// there is no filesystem in a browser tab). Always CPU/F32: the only combination that
+    /// makes sense client-side.
+    pub fn load_from_bytes(
+        rl_agent_config_json: &str,
+        tokenizer_config_json: &str,
+        tokenizer_bytes: &[u8],
+        encoder_config_json: &str,
+        weights: &[u8],
+    ) -> anyhow::Result<Self> {
+        let cfg: RlAgentConfig = serde_json::from_str(rl_agent_config_json)?;
+        let tok = Tokenizer::from_bytes(tokenizer_bytes).map_err(|e| anyhow::anyhow!("tokenizer load failed: {e}"))?;
+        let tok_cfg: TokenizerConfig = serde_json::from_str(tokenizer_config_json)?;
+        let special = SpecialTokens {
+            cls: tok_cfg.cls_token,
+            sep: tok_cfg.sep_token,
+            mask: tok_cfg.mask_token,
+            pad: tok_cfg.pad_token,
+        };
+        let encoder_cfg: ModernBertConfig = serde_json::from_str(encoder_config_json)?;
+
+        let device = Device::Cpu;
+        let n_act = cfg.act_costs.len() + 1;
+        let compute_dtype = DType::F32;
+        let tensors = crate::safetensors32::load_buffer(weights, &device)?;
+        let vb = VarBuilder::from_tensors(tensors, compute_dtype, &device);
         let model = DecisionModel::load(encoder_cfg, cfg.head_layers, n_act, vb)?;
 
         Ok(Self { tok, special, model, cfg, device })
@@ -173,5 +204,21 @@ impl RLAgent {
             out.push((qid.clone(), answer));
         }
         Ok(out)
+    }
+}
+
+/// `laya jev`'s and the wasm binding's shared output shape: `{"type": "choice"|"score"|"noul", ...}`.
+pub fn answer_to_json(answer: Answer) -> Value {
+    match answer {
+        Answer::Choice { choice, probabilities, confidence, act_probability } => json!({
+            "type": "choice", "choice": choice, "confidence": confidence, "act_probability": act_probability,
+            "probabilities": probabilities.into_iter().collect::<BTreeMap<_, _>>(),
+        }),
+        Answer::Score { score, legend, probabilities, confidence, act_probability } => json!({
+            "type": "score", "score": score, "confidence": confidence, "act_probability": act_probability,
+            "legend": legend.iter().enumerate().map(|(i, c)| (i.to_string(), c.clone())).collect::<BTreeMap<_, _>>(),
+            "probabilities": probabilities.iter().enumerate().map(|(i, p)| (i.to_string(), *p)).collect::<BTreeMap<_, _>>(),
+        }),
+        Answer::Noul { noul, act_probability } => json!({ "type": "noul", "noul": noul, "act_probability": act_probability }),
     }
 }

@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "laya-rs-website",
+  "compatibility_date": "2026-08-03",
+  // A static site with no server code: there is no "main", so the Worker is
+  // assets-only and every request is served straight from the edge.
+  "assets": {
+    "directory": "./dist",
+    // The router is client-side, so a request for a deep link has to return
+    // index.html rather than a 404 and let Solid resolve the route.
+    "not_found_handling": "single-page-application"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,29 @@
+# Maintainer: apiplant <releases@apiplant.com>
+#
+# Built by the release workflow, which fills in the version and checksum and
+# publishes the resulting package to apiplant.github.io/pacman. It is not an
+# AUR manifest: the package is named `laya-rs` rather than `laya-rs-bin` and
+# carries no `provides`/`conflicts` pair.
+pkgname=laya-rs
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Rust (candle) inference for Laya's typed-decision engine"
+arch=('x86_64')
+url="https://github.com/apiplant/laya-rs"
+license=('Apache-2.0')
+depends=()
+# The release archive holding the `laya` binary and the README. The workflow
+# builds the package before the release exists and drops the archive next to
+# this file, which makepkg picks up instead of downloading; the URL is what
+# makes the PKGBUILD work on its own once the release is published.
+source=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/laya-rs-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('@SHA_LINUX_X86_64@')
+# The release profile already strips symbols, and makepkg's strip pass on an
+# LTO'd binary buys nothing.
+options=('!strip' '!debug')
+
+package() {
+  local src="$srcdir/laya-rs-v$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm755 "$src/laya" "$pkgdir/usr/bin/laya"
+  install -Dm644 "$src/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

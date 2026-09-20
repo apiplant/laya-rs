@@ -1,0 +1,786 @@
+name: release
+
+# Tag a version to cut a release:
+#
+#   git tag v0.x.0 && git push origin v0.x.0
+#
+# That builds `laya` for every supported CPU platform (plus a CUDA +
+# flash-attn build for Linux x86_64), attaches the archives, checksums, and
+# distro packages to the GitHub release, and publishes the laya-rs library
+# crate to crates.io.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run: no release is published)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A release build is LTO + one codegen unit; the extra debug info earlier
+  # stages emit is stripped anyway.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --bins --target ${{ matrix.target }}
+
+      # One archive per target, named after it, holding the binary and the
+      # README — enough to unpack anywhere and run.
+      - name: Package
+        shell: bash
+        run: |
+          name="laya-rs-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/laya" "$name/"
+          cp README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: |
+            laya-rs-*.tar.gz
+            laya-rs-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # A second, CUDA + flash-attn build of the same binary, x86_64 Linux only
+  # (the only platform with both a CUDA toolkit and an audience for it).
+  # flash-attn is laya's own recommended GPU path (fused kernels, unpadded
+  # varlen attention — see the README's performance section), so it's the
+  # only GPU archive shipped; there is no separate plain-`cuda`-only build.
+  # It needs nvcc and the CUDA headers/stub libs at *build* time, not a GPU —
+  # the devel container image provides those without needing a GPU runner.
+  flash-attn-binary:
+    name: x86_64-unknown-linux-gnu (flash-attn)
+    runs-on: ubuntu-22.04
+    # Best-effort pin, not a verified-safe one like the CPU jobs above:
+    # candle-flash-attn's own build script has no documented CUDA toolkit
+    # version requirement (it fetches a pinned CUTLASS commit and needs
+    # sm80+/C++17), so this is a reasonable modern default rather than a
+    # value known to dodge a specific compatibility bug. If the first run of
+    # this job fails to compile, check candle-flash-attn/candle-kernels'
+    # CHANGELOG at the pinned `candle-core = "0.9"` version for a known-good
+    # CUDA toolkit range and repin here.
+    container: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-flash-attn
+
+      - name: Build
+        env:
+          # The runner has no GPU, so candle's build script can't query
+          # nvidia-smi for the compute capability - pin a comma-separated
+          # list explicitly instead of one value, so the published binary
+          # runs across the common GPU generations flash-attn actually
+          # supports (Ampere+ only — flash-attn's async-copy kernels need
+          # sm80, unlike the plain `cuda` feature which also runs on
+          # Turing). 80 = A100/A30, 86 = RTX 30xx/A10/A40, 89 = RTX 40xx/L4,
+          # 90 = H100. Widen or narrow this list as needed.
+          CUDA_COMPUTE_CAP: "80;86;89;90"
+        run: cargo build --release --locked --bins --features flash-attn
+
+      - name: Package
+        shell: bash
+        run: |
+          name="laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp target/release/laya "$name/"
+          cp README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-gnu-flash-attn
+          path: |
+            laya-rs-flash-attn-*.tar.gz
+            laya-rs-flash-attn-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Repackaging, not building: the .debs and the pacman package are assembled
+  # on one runner from the archives the `binaries` and `flash-attn-binary`
+  # jobs produced, because putting an already-built binary into an ar or zst
+  # archive is architecture-independent work.
+  packages:
+    name: distro packages
+    needs: [binaries, flash-attn-binary]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Build the Debian packages
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p debs
+
+          build() { # <debian arch> <rust target>
+            local arch="$1" triple="$2"
+
+            tar xzf "dist/laya-rs-${GITHUB_REF_NAME}-$triple.tar.gz"
+            local src="laya-rs-${GITHUB_REF_NAME}-$triple"
+            local root="stage/laya-rs-$arch"
+
+            install -Dm755 "$src/laya" "$root/usr/bin/laya"
+            install -Dm644 "$src/README.md" "$root/usr/share/doc/laya-rs/README.md"
+
+            # dpkg reports installed size in KiB, and dpkg-deb does not work
+            # it out on its own — a missing or wrong value is what makes
+            # `apt` mis-report what an install will cost.
+            local size
+            size=$(du -ks "$root/usr" | cut -f1)
+
+            install -d "$root/DEBIAN"
+            sed -e "s/@VERSION@/$version/" \
+                -e "s/@ARCH@/$arch/" \
+                -e "s/@INSTALLED_SIZE@/$size/" \
+                "packaging/debian/control" > "$root/DEBIAN/control"
+
+            if grep -qE '@[A-Z_]+@' "$root/DEBIAN/control"; then
+              echo "::error::unsubstituted placeholder in the control file" >&2
+              exit 1
+            fi
+
+            # Everything ships as root:root regardless of who the runner is.
+            dpkg-deb --root-owner-group --build "$root" \
+              "debs/laya-rs_${version}-1_${arch}.deb"
+          }
+
+          build amd64 x86_64-unknown-linux-gnu
+          build arm64 aarch64-unknown-linux-gnu
+
+          # The flash-attn build, x86_64 only, from its own archive and
+          # control file (different Depends/Conflicts/Provides than the CPU
+          # build).
+          tar xzf "dist/laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          flash_src="laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          flash_root="stage/laya-rs-flash-attn-amd64"
+
+          install -Dm755 "$flash_src/laya" "$flash_root/usr/bin/laya"
+          install -Dm644 "$flash_src/README.md" "$flash_root/usr/share/doc/laya-rs-flash-attn/README.md"
+
+          flash_size=$(du -ks "$flash_root/usr" | cut -f1)
+
+          install -d "$flash_root/DEBIAN"
+          sed -e "s/@VERSION@/$version/" \
+              -e "s/@ARCH@/amd64/" \
+              -e "s/@INSTALLED_SIZE@/$flash_size/" \
+              "packaging/debian/control-flash-attn" > "$flash_root/DEBIAN/control"
+
+          if grep -qE '@[A-Z_]+@' "$flash_root/DEBIAN/control"; then
+            echo "::error::unsubstituted placeholder in the flash-attn control file" >&2
+            exit 1
+          fi
+
+          dpkg-deb --root-owner-group --build "$flash_root" \
+            "debs/laya-rs-flash-attn_${version}-1_amd64.deb"
+
+          cd debs
+          for deb in *.deb; do shasum -a 256 "$deb" > "$deb.sha256"; done
+
+      # Only x86_64: the pacman repository serves that one architecture, and an
+      # aarch64 package would need either an arm runner or emulation for no
+      # audience. The Arch tooling comes from a container rather than the
+      # runner, so this stays a step in the same job as the .debs.
+      - name: Build the pacman package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p pkg
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA_LINUX_X86_64@/$(sha256sum "dist/laya-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)/" \
+            "packaging/pacman/PKGBUILD" > "pkg/PKGBUILD"
+
+          if grep -qE '@[A-Z_]+@' "pkg/PKGBUILD"; then
+            echo "::error::unsubstituted placeholder in PKGBUILD" >&2
+            grep -nE '@[A-Z_]+@' "pkg/PKGBUILD" >&2
+            exit 1
+          fi
+
+          # The release does not exist yet, so the archive is placed under the
+          # name the source line gives it: makepkg checksums what is already
+          # there instead of fetching the URL.
+          cp "dist/laya-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+             "pkg/laya-rs-$version-x86_64.tar.gz"
+
+          # makepkg refuses to run as root, so the build runs as an unprivileged
+          # user inside the container — and the tree is handed back to the
+          # runner's own uid afterwards, or the steps below cannot write to it.
+          docker run --rm -v "$PWD/pkg:/pkg" -e "OWNER=$(id -u):$(id -g)" \
+            archlinux:base-devel bash -c '
+              set -eu
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c "cd /pkg && makepkg --cleanbuild --force --nodeps -p PKGBUILD"
+              chown -R "$OWNER" /pkg
+            '
+
+          [ -f "pkg/laya-rs-$version-1-x86_64.pkg.tar.zst" ]
+          cd pkg
+          shasum -a 256 "laya-rs-$version-1-x86_64.pkg.tar.zst" \
+            > "laya-rs-$version-1-x86_64.pkg.tar.zst.sha256"
+          cd ..
+
+          # Same idea, flash-attn build: its own PKGBUILD (different depends,
+          # conflicts/provides against laya-rs) and its own archive.
+          mkdir -p pkg-flash-attn
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA_LINUX_X86_64_FLASH_ATTN@/$(sha256sum "dist/laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)/" \
+            "packaging/pacman/PKGBUILD-flash-attn" > "pkg-flash-attn/PKGBUILD"
+
+          if grep -qE '@[A-Z_]+@' "pkg-flash-attn/PKGBUILD"; then
+            echo "::error::unsubstituted placeholder in PKGBUILD-flash-attn" >&2
+            grep -nE '@[A-Z_]+@' "pkg-flash-attn/PKGBUILD" >&2
+            exit 1
+          fi
+
+          cp "dist/laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+             "pkg-flash-attn/laya-rs-flash-attn-$version-x86_64.tar.gz"
+
+          docker run --rm -v "$PWD/pkg-flash-attn:/pkg" -e "OWNER=$(id -u):$(id -g)" \
+            archlinux:base-devel bash -c '
+              set -eu
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c "cd /pkg && makepkg --cleanbuild --force --nodeps -p PKGBUILD"
+              chown -R "$OWNER" /pkg
+            '
+
+          [ -f "pkg-flash-attn/laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst" ]
+          cd pkg-flash-attn
+          shasum -a 256 "laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst" \
+            > "laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst.sha256"
+          cd ..
+
+          # Copied alongside the CPU package rather than kept in its own
+          # build directory: the artifact upload below infers its root from
+          # the common ancestor of the paths it's given, and one flat `pkg/`
+          # keeps that root the same as before instead of nesting it.
+          cp pkg-flash-attn/laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst \
+             pkg-flash-attn/laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst.sha256 \
+             pkg/
+
+      # A package that installs but declares the wrong architecture, or that
+      # quietly lost the binary, is worth catching before it is a release asset.
+      - name: Check
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          dpkg-deb --info "debs/laya-rs_${version}-1_amd64.deb"
+          dpkg-deb --contents "debs/laya-rs_${version}-1_amd64.deb" | grep -q "./usr/bin/laya"
+          [ "$(dpkg-deb --field "debs/laya-rs_${version}-1_arm64.deb" Architecture)" = arm64 ]
+
+          # The flash-attn .deb declares a Depends on libcuda1, which the
+          # runner doesn't have and shouldn't be made to install (that would
+          # pull in an NVIDIA driver package on a CI box). Check its metadata
+          # and contents instead of installing it.
+          dpkg-deb --info "debs/laya-rs-flash-attn_${version}-1_amd64.deb"
+          dpkg-deb --contents "debs/laya-rs-flash-attn_${version}-1_amd64.deb" | grep -q "./usr/bin/laya"
+          [ "$(dpkg-deb --field "debs/laya-rs-flash-attn_${version}-1_amd64.deb" Depends)" = "libcuda1" ]
+          [ "$(dpkg-deb --field "debs/laya-rs-flash-attn_${version}-1_amd64.deb" Conflicts)" = "laya-rs" ]
+
+          # The runner is amd64, so only that one can actually be installed and
+          # run — which is the check that matters: `--version` proves the
+          # binary survived the round trip.
+          sudo dpkg -i "debs/laya-rs_${version}-1_amd64.deb" || sudo apt-get install -fy
+          [ "$(laya --version)" = "laya $version" ]
+          sudo dpkg -r laya-rs
+
+          # The pacman package cannot be installed on the runner, but its
+          # metadata and contents can be read back out of the archive.
+          docker run --rm -v "$PWD/pkg:/pkg" archlinux:base-devel bash -c "
+            set -eu
+            pkg=/pkg/laya-rs-$version-1-x86_64.pkg.tar.zst
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgname = laya-rs'
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgver = $version-1'
+            bsdtar -tf \"\$pkg\" | grep -qx 'usr/bin/laya'
+          "
+
+          # Same read-back check for the flash-attn pacman package.
+          docker run --rm -v "$PWD/pkg:/pkg" archlinux:base-devel bash -c "
+            set -eu
+            pkg=/pkg/laya-rs-flash-attn-$version-1-x86_64.pkg.tar.zst
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgname = laya-rs-flash-attn'
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgver = $version-1'
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'conflict = laya-rs'
+            bsdtar -tf \"\$pkg\" | grep -qx 'usr/bin/laya'
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            debs/*.deb
+            debs/*.deb.sha256
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacman-package
+          path: |
+            pkg/*.pkg.tar.zst
+            pkg/*.pkg.tar.zst.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [binaries, flash-attn-binary, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: debian-packages
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Binaries
+
+            | platform | archive |
+            | --- | --- |
+            | macOS Apple Silicon | `laya-rs-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz` |
+            | Linux x86_64 | `laya-rs-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz` |
+            | Linux aarch64 | `laya-rs-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz` |
+
+            Each archive holds `laya` and the README.
+
+            ## CUDA + flash-attn build
+
+            A CUDA-enabled build with laya's fused/unpadded flash-attention path
+            (`--features flash-attn`), Linux x86_64 only:
+            `laya-rs-flash-attn-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz`.
+            Requires an Ampere-or-newer NVIDIA GPU (sm80+) and a host CUDA driver
+            compatible with the toolkit version it was built against (see
+            `packaging/README.md`).
+
+            ## Debian packages
+
+            ```
+            sudo dpkg -i laya-rs_${{ steps.version.outputs.version }}-1_amd64.deb
+            ```
+
+            | platform | package |
+            | --- | --- |
+            | Debian/Ubuntu amd64 | `laya-rs_${{ steps.version.outputs.version }}-1_amd64.deb` |
+            | Debian/Ubuntu arm64 | `laya-rs_${{ steps.version.outputs.version }}-1_arm64.deb` |
+            | Debian/Ubuntu amd64, CUDA + flash-attn | `laya-rs-flash-attn_${{ steps.version.outputs.version }}-1_amd64.deb` |
+
+            `laya-rs-flash-attn` conflicts with `laya-rs` (both install the same
+            binary name), so only one can be installed at a time. It depends on
+            `libcuda1`; see the CUDA build note above for driver compatibility.
+
+            ## Arch package
+
+            ```
+            sudo pacman -U laya-rs-${{ steps.version.outputs.version }}-1-x86_64.pkg.tar.zst
+            ```
+
+            A CUDA + flash-attn build is published the same way, as
+            `laya-rs-flash-attn-${{ steps.version.outputs.version }}-1-x86_64.pkg.tar.zst`,
+            depending on `nvidia-utils` and conflicting with `laya-rs`.
+
+            The same package is published to the signed pacman repository at
+            `apiplant.github.io/pacman`, which is the way to get updates with
+            `pacman -Syu` (one-time setup, then this repeats nothing):
+
+            ```
+            curl -sSfL https://apiplant.github.io/pacman/apiplant.gpg -o /tmp/apiplant.gpg
+            keyid=$(gpg --show-keys --with-colons /tmp/apiplant.gpg | awk -F: '/^pub:/ { print $5; exit }') && sudo pacman-key --add /tmp/apiplant.gpg && sudo pacman-key --finger "$keyid" && sudo pacman-key --lsign-key "$keyid"
+            printf '\n[apiplant]\nSigLevel = Required DatabaseOptional\nServer = https://apiplant.github.io/pacman/$arch\n' | sudo tee -a /etc/pacman.conf > /dev/null
+            sudo pacman -Sy laya-rs
+            ```
+
+            ## apt
+
+            The Debian packages above are also published to the signed apt
+            repository at `apt.apiplant.com`, which is the way to get updates
+            with `apt upgrade` (one-time setup):
+
+            ```
+            curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+            sudo apt update && sudo apt install laya-rs
+            ```
+
+            ## Homebrew
+
+            ```
+            brew tap apiplant/tap
+            brew install apiplant/tap/laya-rs
+            ```
+
+            ## crates.io
+
+            ```
+            cargo install laya-rs     # binary
+            cargo add laya-rs         # library
+            ```
+
+            Each archive and package has a matching `.sha256` file.
+
+  # Publishing the library, not repackaging: `cargo publish` builds from the
+  # tagged source and uploads to crates.io directly, independent of the
+  # binary archives the other jobs assemble.
+  crates-io:
+    name: crates.io
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --locked
+
+  # The formula points at the release archives by URL, so it should only
+  # publish after the release itself exists — hence `needs: release` rather
+  # than running alongside it. Guarded on its credential: a fork, or this
+  # repository before the secret is set, skips it instead of failing the run.
+  homebrew:
+    name: homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Render the formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha() { shasum -a 256 "dist/laya-rs-${GITHUB_REF_NAME}-$1.tar.gz" | cut -d' ' -f1; }
+
+          sed \
+            -e "s/@VERSION@/$version/g" \
+            -e "s/@SHA_MACOS_ARM64@/$(sha aarch64-apple-darwin)/" \
+            -e "s/@SHA_LINUX_X86_64@/$(sha x86_64-unknown-linux-gnu)/" \
+            -e "s/@SHA_LINUX_ARM64@/$(sha aarch64-unknown-linux-gnu)/" \
+            "packaging/homebrew/laya-rs.rb" > "/tmp/laya-rs.rb"
+
+          # A leftover placeholder means an archive was missing and `sha`
+          # returned nothing — publishing that formula would break `brew
+          # install` for everyone on that platform.
+          if grep -qE '@[A-Z_]+@' "/tmp/laya-rs.rb"; then
+            echo "::error::unsubstituted placeholder in laya-rs.rb" >&2
+            grep -nE '@[A-Z_]+@' "/tmp/laya-rs.rb" >&2
+            exit 1
+          fi
+
+      - name: Push to apiplant/homebrew-tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/apiplant/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp /tmp/laya-rs.rb tap/Formula/laya-rs.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/laya-rs.rb
+          # Re-running a release for the same tag is a no-op rather than an error.
+          git diff --cached --quiet && exit 0
+          git commit -m "laya-rs $version"
+          git push
+
+  # The apt repository is cumulative: the new .debs are copied into the pool
+  # alongside the packages from other apiplant releases, and the indices are
+  # regenerated over the whole pool.
+  apt:
+    name: apt repository
+    needs: [packages, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # dpkg-scanpackages and apt-ftparchive are Debian's own tools; the runner
+    # has apt but not dpkg-dev, and a container is cheaper than installing it.
+    container: debian:bookworm
+    env:
+      APT_REPO_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg git ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          path: source
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: debs
+          name: debian-packages
+
+      - name: Import the signing key
+        if: env.APT_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::APT_REPO_TOKEN is set but APT_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          # The key id is needed explicitly: a CI keyring with one secret key
+          # still has no default, and an unsigned Release is one apt refuses.
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the packages to the pool
+        if: env.APT_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${APT_REPO_TOKEN}@github.com/apiplant/apt.git" repo
+
+          # `pool/main/l/laya-rs/` is the layout apt expects: component,
+          # then the first letter of the source package, then the package.
+          mkdir -p repo/pool/main/l/laya-rs
+          cp debs/*.deb repo/pool/main/l/laya-rs/
+
+          size=$(du -sm repo/pool | cut -f1)
+          if [ "$size" -gt 700 ]; then
+            echo "::warning::the apt pool is ${size}MB; GitHub Pages stops at 1GB." \
+                 "Prune old versions from apiplant/apt or move the pool elsewhere."
+          fi
+
+      - name: Generate the indices
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        run: |
+          for arch in amd64 arm64; do
+            dir="dists/stable/main/binary-$arch"
+            mkdir -p "$dir"
+            # /dev/null as the override file: there is no Debian override
+            # database here, and dpkg-scanpackages insists on the argument.
+            dpkg-scanpackages --arch "$arch" pool /dev/null > "$dir/Packages"
+            gzip -9kf "$dir/Packages"
+            test -s "$dir/Packages"
+          done
+
+          # Written outside the tree and moved in: apt-ftparchive checksums
+          # every file under dists/stable, and a Release file it is midway
+          # through writing is one of them.
+          apt-ftparchive -c ../source/packaging/apt/apt-ftparchive.conf \
+            release dists/stable > /tmp/Release
+          mv /tmp/Release dists/stable/Release
+
+      - name: Sign and publish
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          # A passphrase-less key needs no --passphrase, and passing an empty
+          # one to gpg is an error rather than a no-op. Held in the positional
+          # parameters rather than an array: this job runs in a container, where
+          # the step shell is plain sh and `pass=()` is a syntax error.
+          set --
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            set -- --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE"
+          fi
+
+          # Both signatures: InRelease is what apt fetches, Release.gpg is what
+          # older clients and mirroring tools still look for.
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --detach-sign --armor -o dists/stable/Release.gpg dists/stable/Release
+
+          # The keyring users install, dearmored so it can be dropped into
+          # /usr/share/keyrings and named by `signed-by` as-is.
+          rm -f apiplant.gpg
+          gpg --export "$keyid" > apiplant.gpg
+
+          # GitHub Pages runs Jekyll otherwise, which would rewrite parts of a
+          # tree that has to be served byte-for-byte.
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "laya-rs $version"
+          git push
+
+  # The pacman repository is cumulative: the new package file is copied into
+  # the architecture directory, signed, and added to the repository database
+  # alongside the packages from other apiplant releases. x86_64 only, matching
+  # what the `packages` job builds.
+  pacman:
+    name: pacman repository
+    needs: [release, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      PACMAN_REPO_TOKEN: ${{ secrets.PACMAN_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: pacman -Sy --noconfirm --needed git gnupg ca-certificates
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - name: Import the signing key
+        if: env.PACMAN_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::PACMAN_REPO_TOKEN is set but PACMAN_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the package to the pool
+        if: env.PACMAN_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${PACMAN_REPO_TOKEN}@github.com/apiplant/pacman.git" repo
+
+          mkdir -p repo/x86_64
+          cp dist/*.pkg.tar.zst repo/x86_64/
+
+      - name: Sign, index and publish
+        if: env.PACMAN_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          sign() {
+            rm -f "$1.sig"
+            if [ -n "$GPG_PASSPHRASE" ]; then
+              gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --local-user "$keyid" --detach-sign "$1"
+            else
+              gpg --batch --yes --local-user "$keyid" --detach-sign "$1"
+            fi
+          }
+
+          pkgs=$(printf '%s\n' "$PWD/x86_64"/*.pkg.tar.zst)
+          for pkg in $pkgs; do
+            sign "$pkg"
+          done
+
+          repo-add --include-sigs "x86_64/apiplant.db.tar.zst" $pkgs
+
+          # repo-add leaves apiplant.db and apiplant.files as symlinks to the
+          # .tar.zst files. git stores a symlink as its target path, and GitHub
+          # Pages serves that back as a plain text file — so `pacman -Sy` would
+          # download the string "apiplant.db.tar.zst" instead of a database.
+          # Real copies are what gets committed.
+          for name in apiplant.db apiplant.files; do
+            cp --remove-destination "x86_64/$name.tar.zst" "x86_64/$name"
+          done
+
+          sign "x86_64/apiplant.db"
+          sign "x86_64/apiplant.files"
+
+          rm -f apiplant.gpg
+          gpg --armor --export "$keyid" > apiplant.gpg
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "laya-rs $version"
+          git push
