@@ -40,30 +40,51 @@ CPU by default. For GPU inference:
 cargo build --release --features cuda
 ```
 
-This runs the encoder + decision head in F16 (matching the original Python implementation's own
-default precision, and what actually engages the GPU's tensor cores — inference stayed
-accidentally CPU-only, then F32-on-GPU, through earlier iterations of this port; both were real,
-measured regressions, not just theoretical ones). On an RTX 4090 this took a 16-question typed-
-decisions fixture from several seconds/question down to ~460ms total (details and methodology in
-the gist above).
+This runs in F16 (matching the original Python implementation's own default precision, and what
+actually engages the GPU's tensor cores).
 
-An optional `flash-attn` feature swaps the encoder's attention for a fused flash-attention
-kernel (via [candle-flash-attn](https://github.com/huggingface/candle)) where it's safe to —
-flash-attn has no key-padding-mask input, so it's only used when every row in a batch has the
-same real (unpadded) length, falling back to the naive path otherwise (this is checked once per
-batch, not assumed):
+An optional `flash-attn` feature additionally swaps the encoder's and decision head's attention
+for a fused flash-attention kernel, and runs the whole stack *unpadded* — real tokens from every
+row are packed into one flat sequence, with row boundaries passed to flash-attn's varlen kernel,
+so padding is never computed on or attended to:
 
 ```bash
 CUDA_COMPUTE_CAP=<your GPU's compute capability, e.g. 89 for Ada/RTX 40xx> \
   cargo build --release --features flash-attn
 ```
 
-First build clones and compiles NVIDIA's cutlass headers against flash-attention's CUDA kernels,
-which takes several minutes (cached after that). On the same fixture this took total time from
-~460ms to ~362ms — a further ~21% on top of the F16 fix, landing at roughly 2.2x the original
-Python implementation's own latency on identical hardware (was ~2.8x on F16 alone). `CUDARC_CUDA_VERSION`
-is pinned in `.cargo/config.toml` since `cudarc` doesn't yet recognize newer CUDA toolkits
-without the override.
+The first build compiles NVIDIA's cutlass headers against flash-attention's CUDA kernels (a few
+minutes, cached afterwards). `CUDARC_CUDA_VERSION` is pinned in `.cargo/config.toml` since
+`cudarc` doesn't yet recognize newer CUDA toolkits without the override.
+
+On an RTX 4090, answering a 16-question typed-decisions fixture (details and methodology in the
+gist above):
+
+| build | fixture total |
+|---|---|
+| `--features cuda` | 369 ms |
+| `--features flash-attn` | **178 ms** |
+| *reference: the original Python implementation, same GPU* | *165 ms* |
+| *reference: the jev API this is benchmarked against* | *441 ms* |
+
+Getting there was mostly about finding places where candle silently takes a slow path, which
+`examples/bench_ops.rs` (per-op micro-benchmarks at the real layer shapes) and
+`examples/bench_fwd.rs` (whole-forward, mirrors a PyTorch script for like-for-like comparison)
+exist to surface:
+
+- `LayerNorm` only uses its fused CUDA kernel when a bias is present. ModernBERT's norms are
+  bias-free, so they were taking an ~8-op fallback that upcasts to F32 — 18x slower than the
+  memory traffic justifies. Passing an explicit zero bias fixes it.
+- `Linear` on a rank-3 input issues a *batched* GEMM instead of one large flattened GEMM (2.3x
+  on the model's biggest matmul).
+- Scaling Q before the QK^T matmul rather than scaling the S×S scores after (~16x fewer
+  elementwise ops, since `head_dim` << `seq_len`).
+- Unpadding once for the whole encoder instead of gathering/scattering per layer.
+
+Note that per-op timing via `LAYA_TIMING=1` inserts a `device.synchronize()` after each op, which
+serializes otherwise-pipelined kernel launches and inflates what it measures — it's useful for
+spotting *relative* outliers, but isolated benchmarks and end-to-end wall time are what the
+numbers above are based on.
 
 ## Usage
 
