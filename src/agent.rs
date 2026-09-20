@@ -93,6 +93,8 @@ impl RLAgent {
     }
 
     pub fn system_one(&self, state: &Value, questions: &[(String, Question)]) -> anyhow::Result<Vec<(String, Answer)>> {
+        let debug_timing = std::env::var("LAYA_TIMING").is_ok();
+        let t_tok = std::time::Instant::now();
         let mut all_ids = Vec::with_capacity(questions.len());
         let mut all_markers = Vec::with_capacity(questions.len());
         let mut qtypes = Vec::with_capacity(questions.len());
@@ -108,6 +110,9 @@ impl RLAgent {
             all_ids.push(built.ids);
         }
 
+        if debug_timing {
+            eprintln!("[timing] tokenize/build_sequence ({} questions): {:.2}ms", questions.len(), t_tok.elapsed().as_secs_f64() * 1e3);
+        }
         let pad_id = self.tok.token_to_id(&self.special.pad).unwrap_or(0);
         let max_l = all_ids.iter().map(|v| v.len()).max().unwrap_or(0);
         let b = all_ids.len();

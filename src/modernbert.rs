@@ -63,14 +63,37 @@ pub struct RopeEntry {
     pub rope_theta: f64,
 }
 
+/// ModernBERT's norms are bias-free, but `LayerNorm::new_no_bias` is a performance trap in
+/// candle: the fused CUDA kernel is only taken when a bias is present, so a bias-free norm falls
+/// back to an ~8-op path that upcasts the whole tensor to F32. Adding an explicit zero bias is
+/// mathematically identical and ~10x faster (measured 0.66ms -> 0.06ms per call at [7,1024,1024]).
 fn layer_norm_no_bias(size: usize, eps: f64, vb: VarBuilder) -> Result<LayerNorm> {
     let weight = vb.get(size, "weight")?;
-    Ok(LayerNorm::new_no_bias(weight, eps))
+    let bias = Tensor::zeros(size, weight.dtype(), weight.device())?;
+    Ok(LayerNorm::new(weight, bias, eps))
 }
 
 fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Linear> {
     let weight = vb.get((out_dim, in_dim), "weight")?;
     Ok(Linear::new(weight, None))
+}
+
+/// `candle_nn::Linear::forward` uses `broadcast_matmul`, which on a rank-3 input issues a
+/// *batched* GEMM (one per batch row) instead of collapsing the leading dims into a single large
+/// GEMM. For [7,1024,1024] x [1024,5248] that measured 1.21ms vs 0.53ms for the equivalent
+/// flattened [7168,1024] matmul — so flatten first, exactly like torch's `F.linear` does.
+pub fn linear_flat(l: &Linear, x: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    if dims.len() <= 2 {
+        return l.forward(x);
+    }
+    let in_dim = dims[dims.len() - 1];
+    let rows: usize = dims[..dims.len() - 1].iter().product();
+    let out = l.forward(&x.reshape((rows, in_dim))?)?;
+    let out_dim = out.dim(D::Minus1)?;
+    let mut shape = dims[..dims.len() - 1].to_vec();
+    shape.push(out_dim);
+    out.reshape(shape)
 }
 
 struct MlpGeglu {
@@ -87,7 +110,7 @@ impl MlpGeglu {
 
     fn forward(&self, x: &Tensor, debug_timing: bool) -> Result<Tensor> {
         let t0 = std::time::Instant::now();
-        let x = self.wi.forward(x)?;
+        let x = linear_flat(&self.wi, x)?;
         record_phase(debug_timing, x.device(), "mlp.wi", t0)?;
 
         let t0 = std::time::Instant::now();
@@ -100,7 +123,7 @@ impl MlpGeglu {
         record_phase(debug_timing, gated.device(), "mlp.gelu_gate", t0)?;
 
         let t0 = std::time::Instant::now();
-        let out = self.wo.forward(&gated)?;
+        let out = linear_flat(&self.wo, &gated)?;
         record_phase(debug_timing, out.device(), "mlp.wo", t0)?;
         Ok(out)
     }
@@ -191,7 +214,7 @@ impl Attention {
         let (b, s, _) = x.dims3()?;
 
         let t0 = std::time::Instant::now();
-        let qkv = self.wqkv.forward(x)?; // [b, s, 3*hidden]
+        let qkv = linear_flat(&self.wqkv, x)?; // [b, s, 3*hidden]
         record_phase(debug_timing, x.device(), "attn.wqkv", t0)?;
         let qkv = qkv.reshape((b, s, 3, self.n_heads, self.head_dim))?;
 
@@ -238,7 +261,7 @@ impl Attention {
             record_phase(debug_timing, x.device(), "attn.flash", t0)?;
 
             let t0 = std::time::Instant::now();
-            let out = self.wo.forward(&out)?;
+            let out = linear_flat(&self.wo, &out)?;
             record_phase(debug_timing, x.device(), "attn.wo", t0)?;
             return Ok(out);
         }
@@ -276,7 +299,7 @@ impl Attention {
         record_phase(debug_timing, x.device(), "attn.merge", t0)?;
 
         let t0 = std::time::Instant::now();
-        let out = self.wo.forward(&out)?;
+        let out = linear_flat(&self.wo, &out)?;
         record_phase(debug_timing, x.device(), "attn.wo", t0)?;
         Ok(out)
     }

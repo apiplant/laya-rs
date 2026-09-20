@@ -5,7 +5,7 @@
 use candle_core::{DType, Tensor, D};
 use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
 
-use crate::modernbert::{ModernBert, ModernBertConfig, VarLenPack};
+use crate::modernbert::{linear_flat, ModernBert, ModernBertConfig, VarLenPack};
 
 fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> candle_core::Result<Linear> {
     let weight = vb.get((out_dim, in_dim), "weight")?;
@@ -51,8 +51,8 @@ impl HeadLayer {
 
         let residual = x.clone();
         let normed = self.norm2.forward(&x)?;
-        let ff = self.linear1.forward(&normed)?.relu()?;
-        let ff = self.linear2.forward(&ff)?;
+        let ff = linear_flat(&self.linear1, &normed)?.relu()?;
+        let ff = linear_flat(&self.linear2, &ff)?;
         residual + ff
     }
 
@@ -93,7 +93,7 @@ impl HeadLayer {
                     out.reshape((b, s, d))?
                 }
             };
-            return self.out_proj.forward(&out);
+            return linear_flat(&self.out_proj, &out);
         }
 
         #[allow(unreachable_code)]
@@ -110,7 +110,7 @@ impl HeadLayer {
             let attn = candle_nn::ops::softmax_last_dim(&attn)?;
             let out = attn.matmul(&v)?; // [b,h,s,hd]
             let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, d))?;
-            self.out_proj.forward(&out)
+            linear_flat(&self.out_proj, &out)
         }
     }
 }
@@ -228,8 +228,8 @@ impl DecisionModel {
         let m = h.gather(&idx, 1)?; // [b,kmax,d]
 
         let scored = self.scorer_norm.forward(&m)?;
-        let scored = self.scorer_l1.forward(&scored)?.gelu_erf()?;
-        let scored = self.scorer_l2.forward(&scored)?.squeeze(D::Minus1)?; // [b,kmax]
+        let scored = linear_flat(&self.scorer_l1, &scored)?.gelu_erf()?;
+        let scored = linear_flat(&self.scorer_l2, &scored)?.squeeze(D::Minus1)?; // [b,kmax]
 
         // masked_fill(~marker_mask, -1e4): logits*mask + (mask-1)*1e4
         let neg = ((marker_mask - 1f64)? * 1e4)?;
