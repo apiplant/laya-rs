@@ -32,6 +32,39 @@ inference time:
 Comparison against the reference `jev` API and a `gliner` baseline on a typed-decisions fixture:
 https://gist.github.com/framp/82a9973988cc41a8b552cb7850b70259
 
+## Performance
+
+CPU by default. For GPU inference:
+
+```bash
+cargo build --release --features cuda
+```
+
+This runs the encoder + decision head in F16 (matching the original Python implementation's own
+default precision, and what actually engages the GPU's tensor cores — inference stayed
+accidentally CPU-only, then F32-on-GPU, through earlier iterations of this port; both were real,
+measured regressions, not just theoretical ones). On an RTX 4090 this took a 16-question typed-
+decisions fixture from several seconds/question down to ~460ms total (details and methodology in
+the gist above).
+
+An optional `flash-attn` feature swaps the encoder's attention for a fused flash-attention
+kernel (via [candle-flash-attn](https://github.com/huggingface/candle)) where it's safe to —
+flash-attn has no key-padding-mask input, so it's only used when every row in a batch has the
+same real (unpadded) length, falling back to the naive path otherwise (this is checked once per
+batch, not assumed):
+
+```bash
+CUDA_COMPUTE_CAP=<your GPU's compute capability, e.g. 89 for Ada/RTX 40xx> \
+  cargo build --release --features flash-attn
+```
+
+First build clones and compiles NVIDIA's cutlass headers against flash-attention's CUDA kernels,
+which takes several minutes (cached after that). On the same fixture this took total time from
+~460ms to ~362ms — a further ~21% on top of the F16 fix, landing at roughly 2.2x the original
+Python implementation's own latency on identical hardware (was ~2.8x on F16 alone). `CUDARC_CUDA_VERSION`
+is pinned in `.cargo/config.toml` since `cudarc` doesn't yet recognize newer CUDA toolkits
+without the override.
+
 ## Usage
 
 ```bash

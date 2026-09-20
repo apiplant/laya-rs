@@ -14,6 +14,7 @@ path = "src/lib.rs"
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 
 [dependencies]
 candle-core = "0.9"
@@ -26,6 +27,7 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rand_distr = "0.4"
 lingua = "1.8.0"
+candle-flash-attn = { version = "0.9", optional = true }
 
 [profile.release]
 opt-level = 3

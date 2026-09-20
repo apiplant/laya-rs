@@ -106,6 +106,19 @@ impl MlpGeglu {
     }
 }
 
+/// How `Attention::forward` should compute the attention matrix for one layer.
+#[derive(Clone, Copy)]
+pub enum AttnMode {
+    /// Naive 4-op path (matmul, mask add, softmax, matmul); always correct, handles padding.
+    Naive,
+    /// Fused flash-attention kernel, full (unwindowed) attention. Only valid when every row in
+    /// the batch has the same real (unpadded) length — flash-attn has no key-padding-mask input,
+    /// so padded positions would otherwise leak into shorter rows' attention.
+    FlashGlobal,
+    /// Same as `FlashGlobal` but windowed to `local_attention / 2` either side (sliding layers).
+    FlashLocal(usize),
+}
+
 struct Attention {
     wqkv: Linear,
     wo: Linear,
@@ -120,7 +133,8 @@ impl Attention {
         Ok(Self { wqkv, wo, n_heads, head_dim: hidden / n_heads })
     }
 
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, debug_timing: bool) -> Result<Tensor> {
+    #[allow(unused_variables)]
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, mode: AttnMode, debug_timing: bool) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         let t0 = std::time::Instant::now();
@@ -139,9 +153,35 @@ impl Attention {
         let k = apply_rope(&k, cos, sin)?;
         record_phase(debug_timing, x.device(), "attn.rope", t0)?;
 
+        #[cfg(feature = "flash-attn")]
+        {
+            let window = match mode {
+                AttnMode::Naive => None,
+                AttnMode::FlashGlobal => Some(None),
+                AttnMode::FlashLocal(w) => Some(Some(w)),
+            };
+            if let Some(window) = window {
+                let t0 = std::time::Instant::now();
+                let scale = 1f32 / (self.head_dim as f32).sqrt();
+                let qf = q.transpose(1, 2)?.contiguous()?; // [b,s,h,d]
+                let kf = k.transpose(1, 2)?.contiguous()?;
+                let vf = v.transpose(1, 2)?.contiguous()?;
+                let out = candle_flash_attn::flash_attn_windowed(&qf, &kf, &vf, scale, window, window)?; // [b,s,h,d]
+                let out = out.reshape((b, s, self.n_heads * self.head_dim))?;
+                record_phase(debug_timing, x.device(), "attn.flash", t0)?;
+                let t0 = std::time::Instant::now();
+                let out = self.wo.forward(&out)?;
+                record_phase(debug_timing, x.device(), "attn.wo", t0)?;
+                return Ok(out);
+            }
+        }
+
+        // Scale Q (touches b*h*s*d elements) instead of the post-matmul attention scores (b*h*s*s
+        // elements) — s >> d here (1024 vs 64), so this is ~16x fewer elementwise ops for the
+        // same result (softmax is scale-invariant to *where* the constant factor is applied).
         let t0 = std::time::Instant::now();
-        let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?; // [b,h,s,s]
+        let q = (q * (1f64 / (self.head_dim as f64).sqrt()))?;
+        let attn = q.matmul(&k.transpose(D::Minus2, D::Minus1)?)?; // [b,h,s,s]
         record_phase(debug_timing, x.device(), "attn.qk_matmul", t0)?;
 
         let t0 = std::time::Instant::now();
@@ -263,8 +303,21 @@ impl ModernBert {
         let sliding_mask = build_sliding_mask(s, local_window, &self.device)?.to_dtype(compute_dtype)?; // [1,1,s,s] additive
         let global_mask = pad_mask.broadcast_add(&Tensor::zeros((1, 1, s, s), compute_dtype, &self.device)?)?;
         let local_mask = pad_mask.broadcast_add(&sliding_mask)?;
+
+        // Flash-attention has no key-padding-mask input, so it's only safe when every row in
+        // the batch has the same real (unpadded) length — i.e. every row's attention_mask sum is
+        // equal (even if that length is < s, since we then know there's no *ragged* padding).
+        // Checked once per forward call (cheap: b elements), not per layer.
+        #[cfg(feature = "flash-attn")]
+        let use_flash = {
+            let sums = attention_mask.to_dtype(DType::F32)?.sum(1)?.to_vec1::<f32>()?;
+            sums.windows(2).all(|w| w[0] == w[1])
+        };
+        #[cfg(not(feature = "flash-attn"))]
+        let use_flash = false;
+
         if debug_timing { self.device.synchronize()?; }
-        if debug_timing { eprintln!("[timing]   rope+mask build (s={s}): {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        if debug_timing { eprintln!("[timing]   rope+mask build (s={s}, flash={use_flash}): {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
 
         let t0 = std::time::Instant::now();
         for layer in &self.layers {
@@ -278,7 +331,12 @@ impl ModernBert {
             } else {
                 (&cos_l, &sin_l, &local_mask)
             };
-            let attn_out = layer.attn.forward(&normed, cos, sin, mask, debug_timing)?;
+            let mode = match (use_flash, layer.is_global) {
+                (false, _) => AttnMode::Naive,
+                (true, true) => AttnMode::FlashGlobal,
+                (true, false) => AttnMode::FlashLocal(local_window),
+            };
+            let attn_out = layer.attn.forward(&normed, cos, sin, mask, mode, debug_timing)?;
             h = (residual + attn_out)?;
 
             let residual = h.clone();
