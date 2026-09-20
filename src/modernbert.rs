@@ -106,17 +106,70 @@ impl MlpGeglu {
     }
 }
 
-/// How `Attention::forward` should compute the attention matrix for one layer.
-#[derive(Clone, Copy)]
-pub enum AttnMode {
+/// Packing info for the variable-length flash-attention path: lets ragged batches (rows with
+/// different real/unpadded lengths) use the fused kernel by concatenating only the real tokens
+/// into one flat sequence and telling flash-attn where each row starts via `cu_seqlens`. Built
+/// once per forward pass, reused by every layer.
+pub struct VarLenPack {
+    /// Flat indices (into a `[b*s, ...]` view) of every real, non-padding token, row by row.
+    pub indices: Tensor,
+    /// Cumulative sequence lengths, `b + 1` elements: `[0, len_0, len_0+len_1, ...]` (u32).
+    pub cu_seqlens: Tensor,
+    pub max_seqlen: usize,
+    pub total_tokens: usize,
+    /// Per-token position within its own sequence, for RoPE (the packed layout loses the
+    /// positional meaning of the flat index).
+    pub pos_ids: Tensor,
+}
+
+/// Builds the unpadding plan for a batch, or `None` when every row already has the same real
+/// length (nothing to skip, so the dense kernel applies directly). Shared by the encoder and the
+/// decision head so both agree on the packed layout.
+pub fn build_varlen_pack(attention_mask: &Tensor, s: usize, device: &Device) -> Result<Option<VarLenPack>> {
+    let lens: Vec<usize> = attention_mask
+        .to_dtype(DType::F32)?
+        .sum(1)?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|v| *v as usize)
+        .collect();
+    if lens.windows(2).all(|w| w[0] == w[1]) {
+        return Ok(None);
+    }
+    let total: usize = lens.iter().sum();
+    let mut indices: Vec<u32> = Vec::with_capacity(total);
+    let mut pos: Vec<u32> = Vec::with_capacity(total);
+    let mut cu: Vec<u32> = Vec::with_capacity(lens.len() + 1);
+    cu.push(0);
+    let mut acc = 0u32;
+    for (row, &len) in lens.iter().enumerate() {
+        // Sequences are left-aligned (collate fills ids[..len] then pads), so a row's real
+        // tokens are the first `len` slots of its [b*s] span.
+        let base = (row * s) as u32;
+        indices.extend((0..len as u32).map(|i| base + i));
+        pos.extend(0..len as u32);
+        acc += len as u32;
+        cu.push(acc);
+    }
+    Ok(Some(VarLenPack {
+        indices: Tensor::from_vec(indices, total, device)?,
+        cu_seqlens: Tensor::from_vec(cu, lens.len() + 1, device)?,
+        max_seqlen: lens.iter().copied().max().unwrap_or(0),
+        total_tokens: total,
+        pos_ids: Tensor::from_vec(pos, total, device)?,
+    }))
+}
+
+/// How `Attention::forward` should compute attention for one layer.
+pub enum AttnMode<'a> {
     /// Naive 4-op path (matmul, mask add, softmax, matmul); always correct, handles padding.
     Naive,
-    /// Fused flash-attention kernel, full (unwindowed) attention. Only valid when every row in
-    /// the batch has the same real (unpadded) length — flash-attn has no key-padding-mask input,
-    /// so padded positions would otherwise leak into shorter rows' attention.
-    FlashGlobal,
-    /// Same as `FlashGlobal` but windowed to `local_attention / 2` either side (sliding layers).
-    FlashLocal(usize),
+    /// Fused flash-attention kernel. `window` is `None` for full attention (global layers) or
+    /// `Some(local_attention / 2)` for sliding layers. `pack` is `None` when every row already
+    /// has the same real length (no padding to skip), otherwise the varlen packing info — either
+    /// way padded positions never participate, which is what makes this safe despite flash-attn
+    /// having no key-padding-mask input.
+    Flash { window: Option<usize>, pack: Option<&'a VarLenPack> },
 }
 
 struct Attention {
@@ -134,15 +187,63 @@ impl Attention {
     }
 
     #[allow(unused_variables)]
-    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, mode: AttnMode, debug_timing: bool) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor, mode: &AttnMode, debug_timing: bool) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
 
         let t0 = std::time::Instant::now();
         let qkv = self.wqkv.forward(x)?; // [b, s, 3*hidden]
         record_phase(debug_timing, x.device(), "attn.wqkv", t0)?;
+        let qkv = qkv.reshape((b, s, 3, self.n_heads, self.head_dim))?;
+
+        #[cfg(feature = "flash-attn")]
+        if let AttnMode::Flash { window, pack } = mode {
+            let t0 = std::time::Instant::now();
+            // Stay in [b,s,h,d] the whole way: flash-attn reads per-dimension strides and only
+            // requires the *last* dim to be contiguous, so these narrow+squeeze views need no
+            // copy at all (the naive path below has to transpose to [b,h,s,d] and materialize
+            // three full [b,h,s,d] tensors per layer just to feed `matmul`).
+            let q = qkv.narrow(2, 0, 1)?.squeeze(2)?;
+            let k = qkv.narrow(2, 1, 1)?.squeeze(2)?;
+            let v = qkv.narrow(2, 2, 1)?.squeeze(2)?;
+            // cos/sin arrive as [1,1,s,d] for the naive layout; same memory reinterpreted as
+            // [1,s,1,d] broadcasts correctly over [b,s,h,d].
+            let cos = cos.reshape((1, s, 1, self.head_dim))?;
+            let sin = sin.reshape((1, s, 1, self.head_dim))?;
+            let q = apply_rope(&q, &cos, &sin)?;
+            let k = apply_rope(&k, &cos, &sin)?;
+            record_phase(debug_timing, x.device(), "attn.split+rope", t0)?;
+
+            let t0 = std::time::Instant::now();
+            let scale = 1f32 / (self.head_dim as f32).sqrt();
+            let hd = self.n_heads * self.head_dim;
+            let out = match pack {
+                // Dense: one row per sequence, all the same real length, nothing to skip.
+                None => candle_flash_attn::flash_attn_windowed(&q, &k, &v, scale, *window, *window)?,
+                // Packed: `x` is already `[1, total_real_tokens, hidden]` — the encoder unpadded
+                // once on entry — so the varlen kernel just needs the row boundaries. No gather
+                // or scatter here; that was costing ~8ms/row/section when done per layer.
+                Some(p) => {
+                    let flat = |t: &Tensor| -> Result<Tensor> {
+                        t.reshape((p.total_tokens, self.n_heads, self.head_dim))
+                    };
+                    let out = candle_flash_attn::flash_attn_varlen_windowed(
+                        &flat(&q)?, &flat(&k)?, &flat(&v.contiguous()?)?,
+                        &p.cu_seqlens, &p.cu_seqlens,
+                        p.max_seqlen, p.max_seqlen, scale, *window, *window,
+                    )?; // [total, h, d]
+                    out.reshape((1, p.total_tokens, self.n_heads, self.head_dim))?
+                }
+            };
+            let out = out.reshape((b, s, hd))?;
+            record_phase(debug_timing, x.device(), "attn.flash", t0)?;
+
+            let t0 = std::time::Instant::now();
+            let out = self.wo.forward(&out)?;
+            record_phase(debug_timing, x.device(), "attn.wo", t0)?;
+            return Ok(out);
+        }
 
         let t0 = std::time::Instant::now();
-        let qkv = qkv.reshape((b, s, 3, self.n_heads, self.head_dim))?;
         let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?; // [b,h,s,d]
         let k = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
         let v = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
@@ -152,29 +253,6 @@ impl Attention {
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
         record_phase(debug_timing, x.device(), "attn.rope", t0)?;
-
-        #[cfg(feature = "flash-attn")]
-        {
-            let window = match mode {
-                AttnMode::Naive => None,
-                AttnMode::FlashGlobal => Some(None),
-                AttnMode::FlashLocal(w) => Some(Some(w)),
-            };
-            if let Some(window) = window {
-                let t0 = std::time::Instant::now();
-                let scale = 1f32 / (self.head_dim as f32).sqrt();
-                let qf = q.transpose(1, 2)?.contiguous()?; // [b,s,h,d]
-                let kf = k.transpose(1, 2)?.contiguous()?;
-                let vf = v.transpose(1, 2)?.contiguous()?;
-                let out = candle_flash_attn::flash_attn_windowed(&qf, &kf, &vf, scale, window, window)?; // [b,s,h,d]
-                let out = out.reshape((b, s, self.n_heads * self.head_dim))?;
-                record_phase(debug_timing, x.device(), "attn.flash", t0)?;
-                let t0 = std::time::Instant::now();
-                let out = self.wo.forward(&out)?;
-                record_phase(debug_timing, x.device(), "attn.wo", t0)?;
-                return Ok(out);
-            }
-        }
 
         // Scale Q (touches b*h*s*d elements) instead of the post-matmul attention scores (b*h*s*s
         // elements) — s >> d here (1024 vs 64), so this is ~16x fewer elementwise ops for the
@@ -285,7 +363,7 @@ impl ModernBert {
     /// input_ids: [b, s] i64, attention_mask: [b, s] i64 (1 = real token, 0 = pad)
     pub fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let debug_timing = std::env::var("LAYA_TIMING").is_ok();
-        let (_b, s) = input_ids.dims2()?;
+        let (b, s) = input_ids.dims2()?;
         let mut h = self.tok_embeddings.forward(input_ids)?;
         h = self.emb_norm.forward(&h)?;
         let compute_dtype = h.dtype();
@@ -304,20 +382,47 @@ impl ModernBert {
         let global_mask = pad_mask.broadcast_add(&Tensor::zeros((1, 1, s, s), compute_dtype, &self.device)?)?;
         let local_mask = pad_mask.broadcast_add(&sliding_mask)?;
 
-        // Flash-attention has no key-padding-mask input, so it's only safe when every row in
-        // the batch has the same real (unpadded) length — i.e. every row's attention_mask sum is
-        // equal (even if that length is < s, since we then know there's no *ragged* padding).
-        // Checked once per forward call (cheap: b elements), not per layer.
+        // Flash-attention has no key-padding-mask input. Uniform-length batches can use the dense
+        // kernel directly; ragged ones get a varlen pack (real tokens only, plus cu_seqlens) so
+        // padded positions still never participate. Built once per forward, shared by all layers.
         #[cfg(feature = "flash-attn")]
-        let use_flash = {
-            let sums = attention_mask.to_dtype(DType::F32)?.sum(1)?.to_vec1::<f32>()?;
-            sums.windows(2).all(|w| w[0] == w[1])
-        };
+        let (use_flash, pack) = (true, build_varlen_pack(attention_mask, s, &self.device)?);
         #[cfg(not(feature = "flash-attn"))]
-        let use_flash = false;
+        let (use_flash, pack): (bool, Option<VarLenPack>) = (false, None);
 
         if debug_timing { self.device.synchronize()?; }
-        if debug_timing { eprintln!("[timing]   rope+mask build (s={s}, flash={use_flash}): {:.2}ms", t0.elapsed().as_secs_f64() * 1e3); }
+        if debug_timing {
+            let lens = attention_mask.to_dtype(DType::F32)?.sum(1)?.to_vec1::<f32>()?;
+            let real: f32 = lens.iter().sum();
+            let padded = (lens.len() * s) as f32;
+            eprintln!(
+                "[timing]   rope+mask build (s={s}, flash={use_flash}): {:.2}ms | row lens {:?} = {:.0} real / {:.0} padded ({:.0}% waste)",
+                t0.elapsed().as_secs_f64() * 1e3,
+                lens.iter().map(|v| *v as usize).collect::<Vec<_>>(),
+                real, padded, (1.0 - real / padded) * 100.0
+            );
+        }
+
+        // Packed (unpadded) mode: gather every real token into one flat sequence *once*, run all
+        // layers on `[1, total_real_tokens, hidden]`, and scatter back at the end. Every op in a
+        // layer except attention is row-wise, so they're indifferent to the packing — and
+        // attention gets the row boundaries via cu_seqlens. This is what HF's ModernBERT does in
+        // its flash path, and it drops both the per-layer gather/scatter and the compute spent on
+        // padding. RoPE needs each token's position *within its own row*, which the flat index no
+        // longer encodes, so the tables are re-indexed by `pos_ids` up front.
+        let hidden = self.config.hidden_size;
+        let (cos_g, sin_g, cos_l, sin_l) = match pack.as_ref() {
+            None => (cos_g, sin_g, cos_l, sin_l),
+            Some(p) => {
+                let take = |t: &Tensor| -> Result<Tensor> {
+                    t.reshape((s, head_dim))?.index_select(&p.pos_ids, 0)?.reshape((1, 1, p.total_tokens, head_dim))
+                };
+                (take(&cos_g)?, take(&sin_g)?, take(&cos_l)?, take(&sin_l)?)
+            }
+        };
+        if let Some(p) = pack.as_ref() {
+            h = h.reshape((b * s, hidden))?.index_select(&p.indices, 0)?.reshape((1, p.total_tokens, hidden))?;
+        }
 
         let t0 = std::time::Instant::now();
         for layer in &self.layers {
@@ -331,12 +436,15 @@ impl ModernBert {
             } else {
                 (&cos_l, &sin_l, &local_mask)
             };
-            let mode = match (use_flash, layer.is_global) {
-                (false, _) => AttnMode::Naive,
-                (true, true) => AttnMode::FlashGlobal,
-                (true, false) => AttnMode::FlashLocal(local_window),
+            let mode = if use_flash {
+                AttnMode::Flash {
+                    window: if layer.is_global { None } else { Some(local_window) },
+                    pack: pack.as_ref(),
+                }
+            } else {
+                AttnMode::Naive
             };
-            let attn_out = layer.attn.forward(&normed, cos, sin, mask, mode, debug_timing)?;
+            let attn_out = layer.attn.forward(&normed, cos, sin, mask, &mode, debug_timing)?;
             h = (residual + attn_out)?;
 
             let residual = h.clone();
@@ -347,6 +455,15 @@ impl ModernBert {
         if debug_timing { self.device.synchronize()?; }
         if debug_timing { eprintln!("[timing]   {} layers: {:.2}ms", self.layers.len(), t0.elapsed().as_secs_f64() * 1e3); }
         if debug_timing { dump_phases(); }
+
+        // Scatter the packed tokens back into their padded slots. Padding positions stay zero:
+        // nothing downstream reads them (option markers always sit inside the real content, and
+        // the decision head masks padding out anyway).
+        if let Some(p) = pack.as_ref() {
+            h = Tensor::zeros((b * s, hidden), h.dtype(), h.device())?
+                .index_add(&p.indices, &h.reshape((p.total_tokens, hidden))?, 0)?
+                .reshape((b, s, hidden))?;
+        }
         self.final_norm.forward(&h)
     }
 }

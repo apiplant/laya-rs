@@ -5,7 +5,7 @@
 use candle_core::{DType, Tensor, D};
 use candle_nn::{Embedding, LayerNorm, Linear, Module, VarBuilder};
 
-use crate::modernbert::{ModernBert, ModernBertConfig};
+use crate::modernbert::{ModernBert, ModernBertConfig, VarLenPack};
 
 fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> candle_core::Result<Linear> {
     let weight = vb.get((out_dim, in_dim), "weight")?;
@@ -43,10 +43,10 @@ impl HeadLayer {
     }
 
     /// x: [b,s,d], key_padding_additive: [b,1,1,s] additive mask (0 keep, -inf pad)
-    fn forward(&self, x: &Tensor, key_padding_additive: &Tensor) -> candle_core::Result<Tensor> {
+    fn forward(&self, x: &Tensor, key_padding_additive: &Tensor, pack: Option<&VarLenPack>) -> candle_core::Result<Tensor> {
         let residual = x.clone();
         let normed = self.norm1.forward(x)?;
-        let attn_out = self.self_attn(&normed, key_padding_additive)?;
+        let attn_out = self.self_attn(&normed, key_padding_additive, pack)?;
         let x = (residual + attn_out)?;
 
         let residual = x.clone();
@@ -56,26 +56,62 @@ impl HeadLayer {
         residual + ff
     }
 
-    fn self_attn(&self, x: &Tensor, key_padding_additive: &Tensor) -> candle_core::Result<Tensor> {
+    #[allow(unused_variables)]
+    fn self_attn(&self, x: &Tensor, key_padding_additive: &Tensor, pack: Option<&VarLenPack>) -> candle_core::Result<Tensor> {
         let (b, s, d) = x.dims3()?;
         let head_dim = d / self.n_heads;
         let qkv = x.broadcast_matmul(&self.in_proj_w.t()?)?.broadcast_add(&self.in_proj_b)?; // [b,s,3d]
         let q = qkv.narrow(D::Minus1, 0, d)?;
         let k = qkv.narrow(D::Minus1, d, d)?;
         let v = qkv.narrow(D::Minus1, 2 * d, d)?;
-        let reshape = |t: Tensor| -> candle_core::Result<Tensor> {
-            t.reshape((b, s, self.n_heads, head_dim))?.transpose(1, 2)?.contiguous()
-        };
-        let q = reshape(q)?;
-        let k = reshape(k)?;
-        let v = reshape(v)?;
-        let scale = 1f64 / (head_dim as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
-        let attn = attn.broadcast_add(key_padding_additive)?;
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v)?; // [b,h,s,hd]
-        let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, d))?;
-        self.out_proj.forward(&out)
+
+        // These two head layers are *full* attention at the encoder's full sequence length, so
+        // they're the most expensive kind to run naively — same fused path as the encoder.
+        #[cfg(feature = "flash-attn")]
+        {
+            let scale = 1f32 / (head_dim as f32).sqrt();
+            let to_bshd = |t: &Tensor| -> candle_core::Result<Tensor> {
+                t.reshape((b, s, self.n_heads, head_dim))
+            };
+            let out = match pack {
+                None => {
+                    let out = candle_flash_attn::flash_attn_windowed(
+                        &to_bshd(&q)?.contiguous()?, &to_bshd(&k)?.contiguous()?, &to_bshd(&v)?.contiguous()?,
+                        scale, None, None,
+                    )?;
+                    out.reshape((b, s, d))?
+                }
+                Some(p) => {
+                    // `x` is already packed to [1, total, d] by the caller.
+                    let flat = |t: &Tensor| -> candle_core::Result<Tensor> {
+                        t.reshape((p.total_tokens, self.n_heads, head_dim))?.contiguous()
+                    };
+                    let out = candle_flash_attn::flash_attn_varlen_windowed(
+                        &flat(&q)?, &flat(&k)?, &flat(&v)?,
+                        &p.cu_seqlens, &p.cu_seqlens, p.max_seqlen, p.max_seqlen, scale, None, None,
+                    )?;
+                    out.reshape((b, s, d))?
+                }
+            };
+            return self.out_proj.forward(&out);
+        }
+
+        #[allow(unreachable_code)]
+        {
+            let reshape = |t: Tensor| -> candle_core::Result<Tensor> {
+                t.reshape((b, s, self.n_heads, head_dim))?.transpose(1, 2)?.contiguous()
+            };
+            let q = reshape(q)?;
+            let k = reshape(k)?;
+            let v = reshape(v)?;
+            let scale = 1f64 / (head_dim as f64).sqrt();
+            let attn = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?)? * scale)?;
+            let attn = attn.broadcast_add(key_padding_additive)?;
+            let attn = candle_nn::ops::softmax_last_dim(&attn)?;
+            let out = attn.matmul(&v)?; // [b,h,s,hd]
+            let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, d))?;
+            self.out_proj.forward(&out)
+        }
     }
 }
 
@@ -164,8 +200,26 @@ impl DecisionModel {
 
         let pad_additive = build_padding_additive(attention_mask)?.to_dtype(compute_dtype)?; // [b,1,1,s]
         let mut h = h;
+
+        // Same unpad-once/repad-once trick the encoder uses: the head's two layers are row-wise
+        // apart from attention, so packing around the pair costs one gather + one scatter total
+        // while letting both use the fused kernel.
+        #[cfg(feature = "flash-attn")]
+        let pack = crate::modernbert::build_varlen_pack(attention_mask, h.dim(1)?, h.device())?;
+        #[cfg(not(feature = "flash-attn"))]
+        let pack: Option<VarLenPack> = None;
+
+        let (bsz, seq) = (h.dim(0)?, h.dim(1)?);
+        if let Some(p) = pack.as_ref() {
+            h = h.reshape((bsz * seq, d))?.index_select(&p.indices, 0)?.reshape((1, p.total_tokens, d))?;
+        }
         for layer in &self.head_layers {
-            h = layer.forward(&h, &pad_additive)?;
+            h = layer.forward(&h, &pad_additive, pack.as_ref())?;
+        }
+        if let Some(p) = pack.as_ref() {
+            h = Tensor::zeros((bsz * seq, d), h.dtype(), h.device())?
+                .index_add(&p.indices, &h.reshape((p.total_tokens, d))?, 0)?
+                .reshape((bsz, seq, d))?;
         }
 
         let kmax = marker_pos.dim(1)?;
