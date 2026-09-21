@@ -1,6 +1,6 @@
 [package]
 name = "laya-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 default-run = "laya"
 description = "Rust (candle) inference for Laya's typed-decision (choice/score/noul) decision engine"
