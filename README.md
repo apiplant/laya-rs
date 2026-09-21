@@ -158,8 +158,12 @@ laya /path/to/laya-typed-decisions
 # ask a single choice question
 laya ask --model-dir /path/to/laya --state "..." --question "..." --option "a" --option "b"
 
-# answer a jev-questions-style batch file
-laya jev questions.json answers.json --model-dir /path/to/laya-typed-decisions
+# answer a batch of typed questions against one state
+laya answer input.json answers.json --model-dir /path/to/laya-typed-decisions
+
+# answer a jev-questions-style batch file ({section: {state, questions}}) —
+# scripts/jev_batch.py drives `laya answer` once per section
+scripts/jev_batch.py questions.json answers.json --model-dir /path/to/laya-typed-decisions
 
 # RLCD training over a JSONL dataset
 laya train /path/to/laya dataset.jsonl --epochs 3

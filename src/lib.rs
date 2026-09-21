@@ -1,8 +1,12 @@
 pub mod agent;
 pub mod batching;
 pub mod decision_model;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod download;
 pub mod fused;
 pub mod metrics;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod model_path;
 pub mod modernbert;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod router;

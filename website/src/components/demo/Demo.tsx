@@ -15,6 +15,20 @@ interface Preset {
 
 const PRESETS: Preset[] = [
   {
+    label: "Refund request",
+    state: "We were billed twice for March. Please refund the duplicate.",
+    questions: {
+      should_refund: {
+        type: "choice",
+        instructions: "Should we issue a refund?",
+        criteria: {
+          yes: null,
+          no: null,
+        },
+      },
+    },
+  },
+  {
     label: "Resume screen",
     state: {
       resume:

@@ -7,7 +7,7 @@ export function DocsCli() {
     <DocsLayout>
       <H1><IC>laya</IC></H1>
       <Lead>
-        One binary: a bare-invocation quick demo, plus <IC>ask</IC>, <IC>jev</IC> and{" "}
+        One binary: a bare-invocation quick demo, plus <IC>ask</IC>, <IC>answer</IC> and{" "}
         <IC>train</IC> subcommands.
       </Lead>
 
@@ -44,40 +44,46 @@ export function DocsCli() {
       </Section>
 
       <Section>
-        <H2><IC>laya jev</IC></H2>
+        <H2><IC>laya answer</IC></H2>
         <P>
-          Answers a <IC>jev</IC>-questions-style batch file (<IC>{"{section: {state, questions}}"}</IC>)
-          and writes typed answers (<IC>{"{section: {qid: {...answer}}}"}</IC>) to an output file:
+          Answers a batch of typed questions against one state (<IC>{"{state, questions}"}</IC>)
+          and writes typed answers (<IC>{"{qid: {...answer}}"}</IC>) to an output file:
         </P>
-        <CopyBlock command={`laya jev questions.json answers.json --model-dir /path/to/laya-typed-decisions`} />
+        <CopyBlock command={`laya answer input.json answers.json --model-dir /path/to/laya-typed-decisions`} />
         <P>
-          Each question in the input file is <IC>{"{type: \"choice\"|\"score\"|\"noul\", instructions, criteria}"}</IC>
+          Each question in <IC>questions</IC> is{" "}
+          <IC>{"{type: \"choice\"|\"score\"|\"noul\", instructions, criteria}"}</IC>
           {" "}— the same shape a Rust caller builds with <IC>batching::RawQuestion</IC>, and the
           same shape the <a href="/demo" class="text-accent hover:text-accent-dim">browser demo</a>'s
           question builder produces. <IC>--only QID</IC> restricts a run to one question id, useful
           when iterating on a single question's wording.
         </P>
-        <Pre caption="questions.json" lang="json">{`{
-  "ticket_42": {
-    "state": { "subject": "Duplicate charge on invoice 4411", "body": "..." },
-    "questions": {
-      "department": {
-        "type": "choice",
-        "instructions": "Which team should handle this?",
-        "criteria": { "billing": "invoices, payments, refunds", "technical": "bugs and outages" }
-      },
-      "urgency": {
-        "type": "score",
-        "instructions": "How urgent is this?",
-        "criteria": ["not urgent", "soon", "blocking"]
-      },
-      "churn_risk": {
-        "type": "noul",
-        "instructions": "Does the user threaten to cancel?"
-      }
+        <Pre caption="input.json" lang="json">{`{
+  "state": { "subject": "Duplicate charge on invoice 4411", "body": "..." },
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": { "billing": "invoices, payments, refunds", "technical": "bugs and outages" }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this?",
+      "criteria": ["not urgent", "soon", "blocking"]
+    },
+    "churn_risk": {
+      "type": "noul",
+      "instructions": "Does the user threaten to cancel?"
     }
   }
 }`}</Pre>
+        <P>
+          <IC>laya answer</IC> only knows one state at a time. To batch-answer a
+          jev-questions-style file (<IC>{"{section: {state, questions}}"}</IC>) into{" "}
+          <IC>{"{section: {qid: {...answer}}}"}</IC>, use <IC>scripts/jev_batch.py</IC>, which
+          calls <IC>laya answer</IC> once per section:
+        </P>
+        <CopyBlock command={`scripts/jev_batch.py questions.json answers.json --model-dir /path/to/laya-typed-decisions`} />
       </Section>
 
       <Section>
@@ -86,7 +92,8 @@ export function DocsCli() {
           rows={[
             { flag: "laya [MODELS_ROOT] [BODY]", meaning: "bare invocation: route + answer three example questions" },
             { flag: "laya ask --model-dir DIR --state S --question Q --option A --option B ...", meaning: "single choice question, printed to stdout" },
-            { flag: "laya jev INPUT OUTPUT --model-dir DIR [--only QID]", meaning: "batch-answer a jev-questions-style file" },
+            { flag: "laya answer INPUT OUTPUT --model-dir DIR [--only QID]", meaning: "batch-answer typed questions against one state" },
+            { flag: "scripts/jev_batch.py INPUT OUTPUT --model-dir DIR [--only QID] [--binary PATH]", meaning: "batch-answer a jev-questions-style file, one `laya answer` call per section" },
             { flag: "laya train MODEL_DIR DATASET [--epochs N] [--lr F] [--group-size N] [--sigma F] [--save-to PATH]", meaning: "RLCD training over a JSONL dataset — see Training" },
           ]}
         />

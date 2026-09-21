@@ -24,7 +24,7 @@ export class WasmAgent {
      * `questions_json` is a JSON object of `{qid: {type, instructions,
      * criteria}}` (see [`crate::batching::RawQuestion`]). Returns JSON
      * `{qid: {type, ...}}`, one answer per question, in the same shape
-     * `laya jev` writes.
+     * `laya answer` writes.
      * @param {string} state_json
      * @param {string} questions_json
      * @returns {string}

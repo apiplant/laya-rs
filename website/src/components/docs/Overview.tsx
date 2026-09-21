@@ -37,7 +37,7 @@ export function DocsOverview() {
           <LI>
             <IC>laya-typed-decisions</IC> — English, a 421M-parameter ModernBERT-large backbone.
             The checkpoint tuned for typed choice/score/noul decisions, and the default the{" "}
-            <IC>laya jev</IC> subcommand resolves to.
+            <IC>laya answer</IC> subcommand resolves to.
           </LI>
           <LI>
             <IC>laya-multilingual</IC> — a 322M-parameter mmBERT-base backbone, for state text
@@ -77,9 +77,11 @@ export function DocsOverview() {
             test.
           </LI>
           <LI>
-            <a href="/docs/cli" class="text-accent hover:text-accent-dim"><IC>laya jev</IC></a> —
-            answers a batch file of <IC>{"{section: {state, questions}}"}</IC> and writes typed
-            answers to an output JSON file.
+            <a href="/docs/cli" class="text-accent hover:text-accent-dim"><IC>laya answer</IC></a> —
+            answers a batch of typed questions against one state (
+            <IC>{"{state, questions}"}</IC>) and writes typed answers to an output JSON file.
+            <IC>scripts/jev_batch.py</IC> drives it once per section for a jev-questions-style
+            batch file (<IC>{"{section: {state, questions}}"}</IC>).
           </LI>
           <LI>
             <a href="/docs/training" class="text-accent hover:text-accent-dim"><IC>laya train</IC></a>{" "}

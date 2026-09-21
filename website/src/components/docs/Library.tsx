@@ -145,7 +145,7 @@ let answers = agent.system_one(&state, &questions)?;`}</Pre>
           <LI><IC>decision_model.rs</IC> — the from-scratch decision head: type embedding, a 2-layer transformer over option markers, the option-marker scorer, and the act (abstention) head.</LI>
           <LI><IC>schema.rs</IC> — <IC>render_options</IC>/<IC>build_sequence</IC>: the typed-question schema builder, matching the original's <IC>[CLS] ... [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]</IC> layout and truncation rules.</LI>
           <LI><IC>fused.rs</IC> — NVRTC-compiled fused RoPE and GeGLU CUDA kernels (the <IC>cuda</IC> feature; <IC>flash-attn</IC> layers its own fused, unpadded attention on top).</LI>
-          <LI><IC>batching.rs</IC> — the record → model-input pipeline shared by training and the <IC>jev</IC> CLI batch format.</LI>
+          <LI><IC>batching.rs</IC> — the record → model-input pipeline shared by training and the <IC>answer</IC> CLI's question format.</LI>
           <LI><IC>train.rs</IC> — the RLCD training loop.</LI>
         </UL>
       </Section>

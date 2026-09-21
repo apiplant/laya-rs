@@ -114,14 +114,20 @@ jobs:
       - name: Build
         env:
           # The runner has no GPU, so candle's build script can't query
-          # nvidia-smi for the compute capability - pin a comma-separated
-          # list explicitly instead of one value, so the published binary
-          # runs across the common GPU generations flash-attn actually
-          # supports (Ampere+ only — flash-attn's async-copy kernels need
-          # sm80, unlike the plain `cuda` feature which also runs on
-          # Turing). 80 = A100/A30, 86 = RTX 30xx/A10/A40, 89 = RTX 40xx/L4,
-          # 90 = H100. Widen or narrow this list as needed.
-          CUDA_COMPUTE_CAP: "80;86;89;90"
+          # nvidia-smi for the compute capability - pin it explicitly.
+          # candle-kernels' build script (bindgen_cuda 0.1.6) only accepts a
+          # single integer here (it does `.parse::<usize>()`, so a `;`- or
+          # `,`-separated list — the format CMake's CUDA_ARCHITECTURES takes
+          # — fails to parse) and compiles one real `sm_<cap>` cubin, no
+          # complementary PTX, so only one architecture can be targeted per
+          # build. 80 (Ampere, A100/A30) is the pick: CUDA's binary
+          # compatibility guarantee covers same-major-version devices with
+          # an equal or higher minor version, so an sm_80 cubin also runs on
+          # 86 (RTX 30xx/A10/A40) and 89 (RTX 40xx/L4) — all compute
+          # capability major version 8. It will NOT run on 90 (H100, major
+          # version 9, flash-attn's async-copy kernels need sm80+); that
+          # needs a separate build with CUDA_COMPUTE_CAP=90 if it's needed.
+          CUDA_COMPUTE_CAP: "80"
         run: cargo build --release --locked --bins --features flash-attn
 
       - name: Package

@@ -2,7 +2,7 @@ import { For, Show } from "solid-js";
 import { Badge } from "../ui";
 
 /** The JSON shape `agent::answer_to_json` produces — one per question,
- * exactly what `laya jev` writes and `WasmAgent::ask` returns. */
+ * exactly what `laya answer` writes and `WasmAgent::ask` returns. */
 interface ChoiceAnswer {
   type: "choice";
   choice: string;

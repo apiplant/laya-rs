@@ -207,7 +207,7 @@ impl RLAgent {
     }
 }
 
-/// `laya jev`'s and the wasm binding's shared output shape: `{"type": "choice"|"score"|"noul", ...}`.
+/// `laya answer`'s and the wasm binding's shared output shape: `{"type": "choice"|"score"|"noul", ...}`.
 pub fn answer_to_json(answer: Answer) -> Value {
     match answer {
         Answer::Choice { choice, probabilities, confidence, act_probability } => json!({

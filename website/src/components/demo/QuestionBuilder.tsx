@@ -1,9 +1,9 @@
-import { createSignal, For, Show, createEffect } from "solid-js";
+import { createSignal, createStore, For, Show, createEffect } from "solid-js";
 import { Button } from "../ui";
 import { JsonView } from "./JsonView";
 
 /** The native laya question schema (`batching::RawQuestion`) — the same
- * shape `laya jev`'s dataset files and `WasmAgent::ask`'s `questions_json`
+ * shape `laya answer`'s input files and `WasmAgent::ask`'s `questions_json`
  * both use, so this builder needs no intermediate conversion. */
 export type QuestionType = "choice" | "score" | "noul";
 
@@ -108,7 +108,7 @@ function rawToCards(qs: QuestionSet): Card[] {
   });
 }
 
-function serialize(cards: Card[]): QuestionSet {
+function serialize(cards: readonly Card[]): QuestionSet {
   const out: QuestionSet = {};
   for (const c of cards) {
     if (c.qid.trim()) out[c.qid.trim()] = cardToRaw(c);
@@ -174,41 +174,70 @@ const TYPE_TABS: { value: QuestionType; label: string; hint: string }[] = [
 /* One question card.                                                  */
 /* ------------------------------------------------------------------ */
 
-function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove: () => void }) {
-  const patch = (p: Partial<Card>) => props.onChange({ ...props.card, ...p });
+function QuestionCard(props: { card: Card; onMutate: (fn: (c: Card) => void) => void; onRemove: () => void }) {
+  // `onMutate` reaches into this card's slot in the parent store and hands
+  // the callback a mutable draft: `c.qid = v`, `c.choiceRows.push(...)`.
+  // That's an in-place write, not a new object, so <For> never sees a
+  // changed reference and never remounts the row — which is what keeps
+  // focus in the input across keystrokes. Rebuilding cards/rows via spread
+  // (the old approach) handed <For> a fresh object per keystroke instead.
 
   function setType(type: QuestionType) {
     if (type === props.card.type) return;
     const fresh = emptyCard(props.card.qid, type);
-    patch({ type, choiceRows: fresh.choiceRows, scoreRows: fresh.scoreRows, noulTrue: "", noulFalse: "" });
+    props.onMutate((c) => {
+      c.type = type;
+      c.choiceRows = fresh.choiceRows;
+      c.scoreRows = fresh.scoreRows;
+      c.noulTrue = "";
+      c.noulFalse = "";
+    });
   }
 
   function addChoiceRow() {
-    patch({ choiceRows: [...props.card.choiceRows, { id: uid(), key: "", desc: "" }] });
+    props.onMutate((c) => {
+      c.choiceRows.push({ id: uid(), key: "", desc: "" });
+    });
   }
-  function updateChoiceRow(id: string, p: Partial<ChoiceRow>) {
-    patch({ choiceRows: props.card.choiceRows.map((r) => (r.id === id ? { ...r, ...p } : r)) });
+  function updateChoiceRow(id: string, key: "key" | "desc", value: string) {
+    props.onMutate((c) => {
+      const row = c.choiceRows.find((r) => r.id === id);
+      if (row) row[key] = value;
+    });
   }
   function removeChoiceRow(id: string) {
-    patch({ choiceRows: props.card.choiceRows.filter((r) => r.id !== id) });
+    props.onMutate((c) => {
+      const i = c.choiceRows.findIndex((r) => r.id === id);
+      if (i >= 0) c.choiceRows.splice(i, 1);
+    });
   }
 
   function addScoreRow() {
-    patch({ scoreRows: [...props.card.scoreRows, { id: uid(), text: "" }] });
+    props.onMutate((c) => {
+      c.scoreRows.push({ id: uid(), text: "" });
+    });
   }
   function updateScoreRow(id: string, text: string) {
-    patch({ scoreRows: props.card.scoreRows.map((r) => (r.id === id ? { ...r, text } : r)) });
+    props.onMutate((c) => {
+      const row = c.scoreRows.find((r) => r.id === id);
+      if (row) row.text = text;
+    });
   }
   function removeScoreRow(id: string) {
-    patch({ scoreRows: props.card.scoreRows.filter((r) => r.id !== id) });
+    props.onMutate((c) => {
+      const i = c.scoreRows.findIndex((r) => r.id === id);
+      if (i >= 0) c.scoreRows.splice(i, 1);
+    });
   }
   function moveScoreRow(id: string, dir: -1 | 1) {
-    const rows = [...props.card.scoreRows];
-    const i = rows.findIndex((r) => r.id === id);
-    const j = i + dir;
-    if (i < 0 || j < 0 || j >= rows.length) return;
-    [rows[i], rows[j]] = [rows[j], rows[i]];
-    patch({ scoreRows: rows });
+    props.onMutate((c) => {
+      const i = c.scoreRows.findIndex((r) => r.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= c.scoreRows.length) return;
+      const tmp = c.scoreRows[i];
+      c.scoreRows[i] = c.scoreRows[j];
+      c.scoreRows[j] = tmp;
+    });
   }
 
   return (
@@ -219,7 +248,12 @@ function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove
           <input
             class={`${inputClass} font-mono`}
             value={props.card.qid}
-            onInput={(e) => patch({ qid: e.currentTarget.value })}
+            onInput={(e) => {
+              const v = e.currentTarget.value;
+              props.onMutate((c) => {
+                c.qid = v;
+              });
+            }}
             placeholder="e.g. department"
           />
         </label>
@@ -250,7 +284,12 @@ function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove
           class={`${inputClass} resize-y`}
           rows={2}
           value={props.card.instructions}
-          onInput={(e) => patch({ instructions: e.currentTarget.value })}
+          onInput={(e) => {
+            const v = e.currentTarget.value;
+            props.onMutate((c) => {
+              c.instructions = v;
+            });
+          }}
           placeholder="What should the model decide?"
         />
       </label>
@@ -265,13 +304,13 @@ function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove
                   <input
                     class={`${inputClass} mt-0 w-32 shrink-0 font-mono`}
                     value={row.key}
-                    onInput={(e) => updateChoiceRow(row.id, { key: e.currentTarget.value })}
+                    onInput={(e) => updateChoiceRow(row.id, "key", e.currentTarget.value)}
                     placeholder="option key"
                   />
                   <input
                     class={`${inputClass} mt-0 flex-1`}
                     value={row.desc}
-                    onInput={(e) => updateChoiceRow(row.id, { desc: e.currentTarget.value })}
+                    onInput={(e) => updateChoiceRow(row.id, "desc", e.currentTarget.value)}
                     placeholder="description (optional)"
                   />
                   <IconButton title="Remove option" danger onClick={() => removeChoiceRow(row.id)}>
@@ -327,7 +366,12 @@ function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove
             <input
               class={inputClass}
               value={props.card.noulTrue}
-              onInput={(e) => patch({ noulTrue: e.currentTarget.value })}
+              onInput={(e) => {
+                const v = e.currentTarget.value;
+                props.onMutate((c) => {
+                  c.noulTrue = v;
+                });
+              }}
               placeholder="yes, the statement holds"
             />
           </label>
@@ -336,7 +380,12 @@ function QuestionCard(props: { card: Card; onChange: (c: Card) => void; onRemove
             <input
               class={inputClass}
               value={props.card.noulFalse}
-              onInput={(e) => patch({ noulFalse: e.currentTarget.value })}
+              onInput={(e) => {
+                const v = e.currentTarget.value;
+                props.onMutate((c) => {
+                  c.noulFalse = v;
+                });
+              }}
               placeholder="no, the statement does not hold"
             />
           </label>
@@ -354,7 +403,11 @@ export function QuestionBuilder(props: {
   preset: () => QuestionSet | null;
   onChange: (qs: QuestionSet) => void;
 }) {
-  const [cards, setCards] = createSignal<Card[]>([emptyCard("question_1")]);
+  // A store, not a signal: edits mutate a card/row in place (see
+  // QuestionCard's onMutate) instead of rebuilding the array with fresh
+  // object references on every keystroke, which is what was remounting the
+  // edited row (and stealing focus) on each typed letter.
+  const [cards, setCards] = createStore<Card[]>([emptyCard("question_1")]);
   const [importText, setImportText] = createSignal("");
   const [importError, setImportError] = createSignal<string | null>(null);
 
@@ -365,12 +418,12 @@ export function QuestionBuilder(props: {
   createEffect(
     () => props.preset(),
     (preset) => {
-      if (preset) setCards(rawToCards(preset));
+      if (preset) setCards(() => rawToCards(preset));
     },
   );
 
   createEffect(
-    () => serialize(cards()),
+    () => serialize(cards),
     (qs) => {
       // Braced body: an effect function may only return undefined or an
       // actual cleanup function, and onChange's return value (whatever the
@@ -380,20 +433,28 @@ export function QuestionBuilder(props: {
   );
 
   function addCard() {
-    setCards([...cards(), emptyCard(`question_${cards().length + 1}`)]);
+    setCards((draft) => {
+      draft.push(emptyCard(`question_${draft.length + 1}`));
+    });
   }
-  function updateCard(id: string, next: Card) {
-    setCards(cards().map((c) => (c.id === id ? next : c)));
+  function mutateCard(id: string, fn: (c: Card) => void) {
+    setCards((draft) => {
+      const card = draft.find((c) => c.id === id);
+      if (card) fn(card);
+    });
   }
   function removeCard(id: string) {
-    setCards(cards().filter((c) => c.id !== id));
+    setCards((draft) => {
+      const i = draft.findIndex((c) => c.id === id);
+      if (i >= 0) draft.splice(i, 1);
+    });
   }
 
   function tryImport() {
     setImportError(null);
     try {
       const parsed = JSON.parse(importText()) as QuestionSet;
-      setCards(rawToCards(parsed));
+      setCards(() => rawToCards(parsed));
       setImportText("");
     } catch (e) {
       setImportError(e instanceof Error ? e.message : String(e));
@@ -403,9 +464,9 @@ export function QuestionBuilder(props: {
   return (
     <div>
       <div class="space-y-3">
-        <For each={cards()}>
+        <For each={cards}>
           {(card) => (
-            <QuestionCard card={card} onChange={(next) => updateCard(card.id, next)} onRemove={() => removeCard(card.id)} />
+            <QuestionCard card={card} onMutate={(fn) => mutateCard(card.id, fn)} onRemove={() => removeCard(card.id)} />
           )}
         </For>
       </div>
@@ -417,7 +478,7 @@ export function QuestionBuilder(props: {
       <details class="mt-4 rounded-xl border border-line bg-surface p-4">
         <summary class="cursor-pointer text-sm font-medium text-ink">Raw JSON (view / import)</summary>
         <div class="mt-3">
-          <JsonView value={serialize(cards())} />
+          <JsonView value={serialize(cards)} />
         </div>
         <label class="mt-3 block">
           {fieldLabel("paste questions JSON to replace everything above")}
