@@ -25,7 +25,7 @@ inference time:
   (GRPO-style) over the same strictly-proper scoring rule (log + spherical + ranked probability
   score) the original uses as its reward, with TD(λ) bootstrapping for multi-turn episodes.
 - **Language routing** — a fast 22-script Unicode detector for the "wrong alphabet" case, backed
-  by [lingua-rs](https://github.com/pemistahl/lingua-rs) for real language identification within
+  by [whichlang](https://github.com/quickwit-oss/whichlang) for language identification within
   Latin script, so routing never has to guess from model confidence (an English-only checkpoint
   can be confidently wrong on scripts it can't read).
 

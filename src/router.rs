@@ -5,13 +5,11 @@
 //! Two layers: a fast "22-alphabet" Unicode script detector handles the common, cheap case
 //! (obviously non-Latin script -> multilingual, no need to run a detector model at all); for
 //! Latin-script text — where script alone can't tell English from French, Vietnamese, etc. — this
-//! defers to [lingua](https://github.com/pemistahl/lingua-rs), a real statistical language-ID
-//! library, instead of a hand-rolled stopword heuristic (an earlier version of this router used
-//! one and it misrouted ordinary English — see `english_stays_english` below).
+//! defers to [whichlang](https://github.com/quickwit-oss/whichlang), a small statistical
+//! language-ID library, instead of a hand-rolled stopword heuristic (an earlier version of this
+//! router used one and it misrouted ordinary English — see `english_stays_english` below).
 
-use std::sync::OnceLock;
-
-use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+use whichlang::Lang;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checkpoint {
@@ -96,17 +94,12 @@ pub fn script_histogram(text: &str) -> Vec<(Script, usize)> {
     v
 }
 
-fn detector() -> &'static LanguageDetector {
-    static DETECTOR: OnceLock<LanguageDetector> = OnceLock::new();
-    DETECTOR.get_or_init(|| LanguageDetectorBuilder::from_all_languages().build())
-}
-
 /// Route a state's text to the checkpoint that can actually read it.
 ///
 /// Dominant non-Latin script -> multilingual immediately (cheap, and catches the README's
 /// motivating case: Khmer scoring 0% accuracy at 95% confidence on the English checkpoint — a
 /// script it can't read at all, where model confidence gives no warning). Dominant Latin script
-/// (or no alphabetic content) -> run `lingua` to tell English apart from other Latin-script
+/// (or no alphabetic content) -> run `whichlang` to tell English apart from other Latin-script
 /// languages (French, Vietnamese, Indonesian, ...), which needs an actual language-ID model, not
 /// a Unicode block check — a hand-rolled stopword-based version of this tried, and misrouted
 /// ordinary English (see `english_stays_english` below) because its word list was too small.
@@ -116,9 +109,9 @@ pub fn route(text: &str) -> Checkpoint {
         Some(s) if s != Script::Latin => return Checkpoint::Multilingual,
         _ => {}
     }
-    match detector().detect_language_of(text) {
-        Some(Language::English) | None => Checkpoint::English,
-        Some(_) => Checkpoint::Multilingual,
+    match whichlang::detect_language(text) {
+        Lang::Eng => Checkpoint::English,
+        _ => Checkpoint::Multilingual,
     }
 }
 

@@ -49,11 +49,15 @@ half = "2"
 tokenizers = { version = "0.20", default-features = false, features = ["unstable_wasm"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Real statistical language-ID, used by `router` to pick english vs multilingual
-# checkpoints. Not needed in the browser demo (the model picker chooses the
-# checkpoint directly) and its wasm32 compatibility is unverified, so it's
-# native-only.
-lingua = "1.8.0"
+# Lightweight statistical language-ID, used by `router` to pick english vs
+# multilingual checkpoints. Not needed in the browser demo (the model picker
+# chooses the checkpoint directly) and its wasm32 compatibility is unverified,
+# so it's native-only. Picked over `lingua` (which was here first) because
+# `lingua`'s default build embeds one n-gram model per supported language —
+# ~300MB across all 75 — while `whichlang` ships one small fixed-size weight
+# table (~1MB) for its 16 languages, which is all the router needs since it
+# only ever calls this on text that's already dominant-Latin-script.
+whichlang = "0.1"
 # Checkpoint downloads (see `download`). The browser demo fetches with the
 # JS `fetch` API instead (website/src/lib/laya.ts), so this is native-only.
 ureq = "2"
@@ -69,3 +73,8 @@ getrandom3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 [profile.release]
 opt-level = 3
 lto = true
+# The flash-attn build statically links candle-kernels/candle-flash-attn's
+# CUTLASS-templated CUDA code, which carries a lot of debug info; stripping
+# is what packaging/pacman/PKGBUILD(-flash-attn) already assume is happening
+# (they skip makepkg's own strip pass on that claim).
+strip = true
