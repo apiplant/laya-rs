@@ -323,7 +323,13 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           dpkg-deb --info "debs/laya-rs_${version}-1_amd64.deb"
-          dpkg-deb --contents "debs/laya-rs_${version}-1_amd64.deb" | grep -q "./usr/bin/laya"
+          # `grep -q` would close its end of the pipe as soon as it matches,
+          # sending dpkg-deb's underlying `tar` a SIGPIPE ("tar: stdout:
+          # write error", reported as "dpkg-deb: error: tar subprocess
+          # returned error exit status 2") — a race that intermittently
+          # fails this step under `pipefail` even though the file is there.
+          # Draining the whole stream instead avoids it.
+          dpkg-deb --contents "debs/laya-rs_${version}-1_amd64.deb" | grep "./usr/bin/laya" > /dev/null
           [ "$(dpkg-deb --field "debs/laya-rs_${version}-1_arm64.deb" Architecture)" = arm64 ]
 
           # The flash-attn .deb declares a Depends on libcuda1, which the
@@ -331,7 +337,7 @@ jobs:
           # pull in an NVIDIA driver package on a CI box). Check its metadata
           # and contents instead of installing it.
           dpkg-deb --info "debs/laya-rs-flash-attn_${version}-1_amd64.deb"
-          dpkg-deb --contents "debs/laya-rs-flash-attn_${version}-1_amd64.deb" | grep -q "./usr/bin/laya"
+          dpkg-deb --contents "debs/laya-rs-flash-attn_${version}-1_amd64.deb" | grep "./usr/bin/laya" > /dev/null
           [ "$(dpkg-deb --field "debs/laya-rs-flash-attn_${version}-1_amd64.deb" Depends)" = "libcuda1" ]
           [ "$(dpkg-deb --field "debs/laya-rs-flash-attn_${version}-1_amd64.deb" Conflicts)" = "laya-rs" ]
 
