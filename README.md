@@ -89,6 +89,72 @@ No macOS Intel build: only Apple Silicon (`aarch64-apple-darwin`) and Linux
 See [`packaging/README.md`](packaging/README.md) for how these packages are
 built and published.
 
+## Library
+
+`cargo add laya-rs` pulls in the `laya` crate (native target; the `wasm32-unknown-unknown`
+target instead exposes `laya::wasm::WasmAgent`, the same interface wrapped for
+`wasm-bindgen` — see `website/src/lib/laya.ts` for how the browser demo drives it). The
+surface is small: load an [`RLAgent`](src/agent.rs) from a checkpoint directory, build typed
+[`Question`](src/schema.rs)s, and get back typed [`Answer`](src/agent.rs)s.
+
+```rust
+use serde_json::json;
+use laya::{Answer, QType, Question, RLAgent};
+
+fn main() -> anyhow::Result<()> {
+    // A checkpoint directory downloaded from Hugging Face (convaiinnovations/laya,
+    // -typed-decisions, or -multilingual) — rl_agent_config.json, tokenizer/, encoder/, model.safetensors.
+    let agent = RLAgent::load("/path/to/laya-typed-decisions")?;
+
+    let state = json!("We were billed twice for March. Please refund the duplicate.");
+    let question = Question {
+        qtype: QType::Choice,
+        instructions: "What does the customer want?".to_string(),
+        choice_criteria: vec![
+            ("refund".to_string(), None),
+            ("cancel".to_string(), None),
+            ("other".to_string(), None),
+        ],
+        score_criteria: vec![],
+        noul_true: None,
+        noul_false: None,
+    };
+
+    // Batched: pass as many (id, Question) pairs as you like in one forward pass.
+    let answers = agent.system_one(&state, &[("intent".to_string(), question)])?;
+    for (id, answer) in answers {
+        match answer {
+            Answer::Choice { choice, probabilities, confidence, act_probability } => {
+                println!("{id}: {choice} (confidence={confidence:.3}, act_p={act_probability:.3})");
+                for (option, p) in probabilities {
+                    println!("    {option}: {p:.3}");
+                }
+            }
+            Answer::Score { score, confidence, .. } => println!("{id}: {score:.2} (confidence={confidence:.3})"),
+            Answer::Noul { noul, .. } => println!("{id}: {noul:.3}"),
+        }
+    }
+    Ok(())
+}
+```
+
+`Answer` is a plain enum, not `Serialize` — `laya::agent::answer_to_json` turns one into the
+same `{"type": "choice"|"score"|"noul", ...}` JSON shape the CLI's `answer` subcommand and the
+wasm bindings emit, if that's more convenient than matching on it directly.
+
+Other pieces of the public API, all optional depending on what you need:
+
+- `laya::route` / `laya::Checkpoint` — the English-vs-multilingual language router, so you can
+  pick a checkpoint from a state string before loading (native only; not exposed to wasm since
+  the browser demo picks a checkpoint from the UI instead).
+- `laya::model_path` / `laya::download` — the CLI's own checkpoint resolution: given a variant
+  key, find it under a local family root or fetch it into `~/.cache/laya-rs` (native only).
+- `RLAgent::load_from_bytes` — the same load path as `RLAgent::load`, but from in-memory file
+  contents instead of a filesystem path (what the wasm bindings use, since there's no filesystem
+  in a browser tab).
+- `laya::RlcdConfig` / `laya::Trainer` — the RLCD training loop (`Trainer::load` +
+  `Trainer::train_step`/`train_jsonl`), for fine-tuning a checkpoint rather than just running it.
+
 ## Performance
 
 CPU by default. For GPU inference:
