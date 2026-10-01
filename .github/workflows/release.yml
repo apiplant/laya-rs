@@ -148,13 +148,58 @@ jobs:
             laya-rs-flash-attn-*.tar.gz.sha256
           if-no-files-found: error
 
+  # The Arch CUDA package is built inside Arch against Arch's own `cuda` package. The Debian build
+  # above links the CUDA 12 cuBLAS (libcublas.so.12); Arch ships a newer CUDA with a different
+  # soname, so a binary built there fails to start with "libcublas.so.12: cannot open shared object
+  # file". Building where the package will be installed keeps the link and the `cuda` dependency
+  # in step. Rolling Arch can break a CUDA build before anything in this repository changes, so a
+  # failure here is not fatal: the Arch package then falls back to the generic CUDA archive.
+  cuda-binary-arch:
+    name: x86_64-unknown-linux-gnu (cuda, arch)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: archlinux:base-devel
+    steps:
+      - name: Install build tools
+        run: pacman -Sy --noconfirm --needed rust cuda git
+
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: bash
+        env:
+          CUDA_COMPUTE_CAP: "80"
+        run: |
+          export PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda CUDA_HOME=/opt/cuda
+          cargo build --release --locked --bins --features flash-attn
+
+      - name: Package
+        shell: bash
+        run: |
+          name="laya-rs-flash-attn-arch-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp target/release/laya "$name/"
+          cp README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-gnu-flash-attn-arch
+          path: |
+            laya-rs-flash-attn-arch-*.tar.gz
+            laya-rs-flash-attn-arch-*.tar.gz.sha256
+          if-no-files-found: error
+
   # Repackaging, not building: the .debs and the pacman package are assembled
   # on one runner from the archives the `binaries` and `flash-attn-binary`
   # jobs produced, because putting an already-built binary into an ar or zst
   # archive is architecture-independent work.
   packages:
     name: distro packages
-    needs: [binaries, flash-attn-binary]
+    needs: [binaries, flash-attn-binary, cuda-binary-arch]
+    # The Arch CUDA build may fail without blocking the release (see its job).
+    if: ${{ !cancelled() && needs.binaries.result == 'success' && needs.flash-attn-binary.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -279,10 +324,18 @@ jobs:
 
           # Same idea, flash-attn build: its own PKGBUILD (different depends,
           # conflicts/provides against laya-rs) and its own archive.
+          # Built against Arch's own CUDA when that job succeeded; otherwise the generic CUDA archive
+          # (which needs the CUDA 12 runtime), so a failure there does not block the release.
+          cuda_prefix=laya-rs-flash-attn-arch
+          if [ ! -f "dist/$cuda_prefix-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" ]; then
+            echo "::warning::no Arch-built CUDA archive; the Arch CUDA package falls back to the CUDA 12 build"
+            cuda_prefix=laya-rs-flash-attn
+          fi
           mkdir -p pkg-flash-attn
           sed \
             -e "s/@VERSION@/$version/g" \
-            -e "s/@SHA_LINUX_X86_64_FLASH_ATTN@/$(sha256sum "dist/laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)/" \
+            -e "s/@ARCHIVE_PREFIX@/$cuda_prefix/g" \
+            -e "s/@SHA_LINUX_X86_64_FLASH_ATTN@/$(sha256sum "dist/$cuda_prefix-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)/" \
             "packaging/pacman/PKGBUILD-flash-attn" > "pkg-flash-attn/PKGBUILD"
 
           if grep -qE '@[A-Z_]+@' "pkg-flash-attn/PKGBUILD"; then
@@ -291,7 +344,7 @@ jobs:
             exit 1
           fi
 
-          cp "dist/laya-rs-flash-attn-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+          cp "dist/$cuda_prefix-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
              "pkg-flash-attn/laya-rs-flash-attn-$version-x86_64.tar.gz"
 
           docker run --rm -v "$PWD/pkg-flash-attn:/pkg" -e "OWNER=$(id -u):$(id -g)" \
