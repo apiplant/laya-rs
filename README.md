@@ -71,9 +71,9 @@ compatible with the CUDA toolkit it was built against).
 As a Rust library, or to build the CLI from source, via crates.io:
 
 ```sh
-cargo add laya-rs         # as a library dependency
-cargo install laya-rs     # for the laya binary
-cargo install laya-rs --features flash-attn  # with CUDA + flash-attn support
+cargo add laya-rs2         # as a library dependency
+cargo install laya-rs2     # for the laya binary
+cargo install laya-rs2 --features flash-attn  # with CUDA + flash-attn support
 ```
 
 | Platform | Ships as |
@@ -91,7 +91,7 @@ built and published.
 
 ## Library
 
-`cargo add laya-rs` pulls in the `laya` crate (native target; the `wasm32-unknown-unknown`
+`cargo add laya-rs2` pulls in the `laya` crate (native target; the `wasm32-unknown-unknown`
 target instead exposes `laya::wasm::WasmAgent`, the same interface wrapped for
 `wasm-bindgen` — see `website/src/lib/laya.ts` for how the browser demo drives it). The
 surface is small: load an [`RLAgent`](src/agent.rs) from a checkpoint directory, build typed

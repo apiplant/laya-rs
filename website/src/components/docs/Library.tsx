@@ -13,11 +13,11 @@ export function DocsLibrary() {
 
       <Section>
         <H2>Install</H2>
-        <CopyBlock command="cargo add laya-rs" />
+        <CopyBlock command="cargo add laya-rs2" />
         <P>
           Enable GPU inference with <IC>cuda</IC> (or <IC>flash-attn</IC>, which pulls in{" "}
           <IC>cuda</IC> and additionally fuses/unpads the encoder and decision head's attention):{" "}
-          <IC>cargo add laya-rs --features flash-attn</IC>.
+          <IC>cargo add laya-rs2 --features flash-attn</IC>.
         </P>
       </Section>
 

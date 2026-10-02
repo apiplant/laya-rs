@@ -24,7 +24,7 @@ const COLUMNS = [
     links: [
       { label: "GitHub", href: GITHUB_URL },
       { label: "Issues", href: `${GITHUB_URL}/issues` },
-      { label: "crates.io", href: "https://crates.io/crates/laya-rs" },
+      { label: "crates.io", href: "https://crates.io/crates/laya-rs2" },
     ],
   },
 ];

@@ -118,9 +118,9 @@ sudo pacman -Sy laya-rs`;
   const aptCommands = `curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
 echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
 sudo apt update && sudo apt install laya-rs`;
-  const cargoCommands = `cargo add laya-rs         # as a library dependency
-cargo install laya-rs     # the laya binary
-cargo install laya-rs --features flash-attn  # with CUDA + flash-attn support`;
+  const cargoCommands = `cargo add laya-rs2         # as a library dependency
+cargo install laya-rs2     # the laya binary
+cargo install laya-rs2 --features flash-attn  # with CUDA + flash-attn support`;
 
   return (
     <div class="mt-8 space-y-4 sm:mt-10">
@@ -311,7 +311,7 @@ export function Home() {
           questions, scored against one state in a single batched forward pass.
         </p>
         <div class="mt-6">
-          <CopyBlock command="cargo add laya-rs" />
+          <CopyBlock command="cargo add laya-rs2" />
         </div>
         <Pre caption="src/main.rs" lang="rust">{`use serde_json::json;
 use laya::{QType, Question, RLAgent};

@@ -1,5 +1,5 @@
 [package]
-name = "laya-rs"
+name = "laya-rs2"
 version = "0.3.1"
 edition = "2021"
 default-run = "laya"
