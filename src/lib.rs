@@ -12,7 +12,7 @@ pub mod modernbert;
 pub mod router;
 pub mod safetensors32;
 pub mod schema;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod server;
 pub mod timing;
 pub mod train;

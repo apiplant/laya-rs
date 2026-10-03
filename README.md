@@ -241,6 +241,15 @@ fn main() -> anyhow::Result<()> {
 }
 ```
 
+**Cargo features.** `cli` (the `laya` binary: clap) and `server` (`laya::server` and `laya serve`: ntex, tokio) are on by default
+so that `cargo install laya-rs2` gives the full binary. If you only want the engine as a library, turn them off to skip those
+dependencies (about 110 fewer crates):
+
+```toml
+laya-rs2 = { version = "0.4", default-features = false }
+# laya-rs2 = { version = "0.4", default-features = false, features = ["server"] }   # library + HTTP server module
+```
+
 `Answer` is a plain enum, not `Serialize` — `laya::agent::answer_to_json` turns one into the
 same `{"type": "choice"|"score"|"noul", ...}` JSON shape the CLI's `answer` subcommand and the
 wasm bindings emit, if that's more convenient than matching on it directly.

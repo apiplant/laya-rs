@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+#[cfg(feature = "server")]
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
@@ -7,6 +8,7 @@ use serde_json::{json, Value};
 
 use laya::agent::answer_to_json;
 use laya::batching::raw_question_to_question;
+#[cfg(feature = "server")]
 use laya::server::{start_server, Answerer, RealAnswerer, ServerConfig};
 use laya::{model_path, route, Checkpoint, QType, Question, RLAgent, RlcdConfig, Trainer};
 
@@ -142,9 +144,14 @@ fn main() -> anyhow::Result<()> {
     // already applied its `LAYA_MODELS_ROOT` env default) is passed in so
     // serve resolves the checkpoint with the same precedence as ask/answer.
     if args.command.as_ref().is_some_and(|c| matches!(c, Command::Serve { .. })) {
-        let command = args.command.clone().expect("checked above");
-        let models_root = args.models_root.clone();
-        return ntex::rt::System::new("laya", ntex::rt::DefaultRuntime).block_on(serve(models_root, command));
+        #[cfg(feature = "server")]
+        {
+            let command = args.command.clone().expect("checked above");
+            let models_root = args.models_root.clone();
+            return ntex::rt::System::new("laya", ntex::rt::DefaultRuntime).block_on(serve(models_root, command));
+        }
+        #[cfg(not(feature = "server"))]
+        anyhow::bail!("this laya binary was built without the `server` feature; rebuild with `--features server`");
     }
 
     if let Some(Command::Ask { model, state, question, options }) = &args.command {
@@ -293,6 +300,7 @@ fn main() -> anyhow::Result<()> {
 /// (readable stderr progress), then `start_server` (bind + ntex HttpServer), the
 /// startup banner, and a wait for ntex's ctrl-c/SIGTERM graceful shutdown
 /// (in-flight forwards complete before exit).
+#[cfg(feature = "server")]
 async fn serve(models_root: Option<PathBuf>, command: Command) -> anyhow::Result<()> {
     let Command::Serve { model, model_variant, host, port, max_model_len, max_request_branches, max_queued } = command else {
         unreachable!("dispatched for Command::Serve")
