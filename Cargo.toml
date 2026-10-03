@@ -1,6 +1,6 @@
 [package]
 name = "laya-rs2"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 default-run = "laya"
 description = "Rust (candle) inference for Laya's typed-decision (choice/score/noul) decision engine"
@@ -19,6 +19,13 @@ name = "laya"
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
 
+# Uses the optional `candle-flash-attn` dep (feature `flash-attn`, CUDA): it
+# must not be built by a plain `cargo test`/`cargo build` on a box without
+# the feature.
+[[example]]
+name = "bench_ops"
+required-features = ["flash-attn"]
+
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
@@ -26,6 +33,15 @@ flash-attn = ["cuda", "dep:candle-flash-attn"]
 [dependencies]
 candle-core = "0.9"
 candle-nn = "0.9"
+# NOTE: deliberately NOT enabling serde_json's `preserve_order` feature
+# crate-wide. It flips every `Value::Object` from a BTreeMap (sorted keys) to
+# an IndexMap (input order), which changes the prompt text for object states
+# in the inference pipeline (schema::serialize_state -> serde_json::to_string)
+# and breaks the episode-prefix tokenization tests in rlcd_training_loop.rs.
+# The Jev protocol layer (src/server/request) instead captures question key
+# order explicitly at the parse boundary (a first `Value` pass plus a
+# serde-ignored second pass that only reads the key sequence), so insertion
+# order is preserved without mutating crate-wide serialization.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -61,6 +77,18 @@ whichlang = "0.1"
 # Checkpoint downloads (see `download`). The browser demo fetches with the
 # JS `fetch` API instead (website/src/lib/laya.ts), so this is native-only.
 ureq = "2"
+# Jev protocol server (src/server/): ntex web server (its own worker threads +
+# graceful signal handling; `tokio` selects the runtime driver). Serial model
+# execution sits behind an async Mutex + bounded admission Semaphore (tokio's
+# `sync` primitives are runtime-agnostic) and the synchronous candle forward is
+# offloaded with `ntex::rt::spawn_blocking`. Native-only, like the server
+# module itself; the wasm32 build never links these (guarded by cfg).
+ntex = { version = "3.12", features = ["tokio"] }
+tokio = { version = "1", features = ["sync"] }
+# ntex 3.12.3 does not compile against ntex-http 1.3.0 (HeaderMap no longer
+# implements FromIterator, which ntex's h2 client relies on), yet its own
+# requirement is `>=1.2.0`; hold the resolver on 1.2.x until ntex catches up.
+ntex-http = "~1.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

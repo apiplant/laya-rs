@@ -32,6 +32,109 @@ inference time:
 Comparison against the reference `jev` API and a `gliner` baseline on a typed-decisions fixture:
 https://gist.github.com/framp/82a9973988cc41a8b552cb7850b70259
 
+## Serving
+
+`laya` can run as a standalone HTTP server exposing the open Jev/Simple-Jev v1
+classifier protocol — a checkpoint, a
+listener, and a handful of endpoints:
+
+```bash
+laya serve
+```
+
+With no arguments this downloads the default `typed-decisions` checkpoint into
+`~/.cache/laya-rs` on first use, loads it, and binds `127.0.0.1:8000`. Point it
+at a specific checkpoint with `--model` (a local directory) or pick a different
+variant with `--model-variant multilingual`. The model name the server reports
+and that clients must echo in each request's `model` field is the value you
+supplied — the variant key (default `typed-decisions`) or the `--model` path.
+
+```bash
+# serve the default (English) checkpoint on 127.0.0.1:8000
+laya serve
+
+# serve a specific local checkpoint directory, on all interfaces, port 9000
+laya serve --model /path/to/laya-typed-decisions --host 0.0.0.0 --port 9000
+```
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /v1/classifier` | Answer a batch of typed questions against one state or chat history |
+| `POST /v1/systemone` | Exact alias of `/v1/classifier` |
+| `GET /health` | `{"status":"ready","model":"<loaded model>"}` — readiness, no inference |
+| `GET /openapi.json` | The OpenAPI 3.1 spec for the endpoints above |
+
+Questions execute **serially** against the model: one forward in flight plus a
+bounded admission queue (16 waiting slots by default). A request that finds the
+queue full gets a `429` with a `Retry-After` header rather than being dropped.
+Each request is capped at 100 questions and a 1 MiB body. Ctrl-C or SIGTERM
+shuts down gracefully — the listener stops accepting, in-flight forwards run to
+completion, then the process exits.
+
+A full request/response:
+
+```bash
+curl -s http://127.0.0.1:8000/v1/classifier \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "typed-decisions",
+    "state": "We were billed twice for March. Please refund the duplicate.",
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the customer want?",
+        "criteria": { "refund": "money back", "cancel": "end the account", "other": null }
+      },
+      "urgency": {
+        "type": "score",
+        "instructions": "How urgent is this?",
+        "criteria": [ "not urgent", "soon", "blocking" ]
+      }
+    }
+  }'
+```
+
+```json
+{
+  "model": "typed-decisions",
+  "answers": {
+    "intent": {
+      "type": "choice",
+      "choice": "refund",
+      "confidence": 0.82,
+      "probabilities": { "refund": 0.82, "cancel": 0.07, "other": 0.11 }
+    },
+    "urgency": {
+      "type": "score",
+      "score": 1.66,
+      "confidence": 0.72,
+      "probabilities": { "0": 0.06, "1": 0.23, "2": 0.72 },
+      "legend": { "0": "not urgent", "1": "soon", "2": "blocking" }
+    }
+  },
+  "usage": { "input_tokens": 78, "output_tokens": 0 }
+}
+```
+
+`state` accepts a string, a JSON object, or a JSON array; `messages` accepts a
+text-only chat history (`role` + `content`) as an alternative — send exactly one
+of the two. The three question types (`choice`, `score`, `noul`) and the full
+`422` error envelope (`error.details[]`) are documented in
+`src/server/`.
+
+`laya serve` options:
+
+| Flag | Env | Default | Description |
+| --- | --- | --- | --- |
+| `--model <DIR>` | `LAYA_MODEL` | — | A local checkpoint directory, bypassing `--model-variant`/`--models-root` |
+| `--model-variant <KEY>` | — | `typed-decisions` | Which checkpoint to use when `--model` isn't given |
+| `--models-root <DIR>` | `LAYA_MODELS_ROOT` | — | Root of a checkpoint family, checked before downloading |
+| `--host <ADDR>` | — | `127.0.0.1` | Bind address |
+| `--port <N>` | — | `8000` | Bind port |
+| `--max-model-len <N>` | `LAYA_MAX_MODEL_LEN` | checkpoint `max_len` | Per-question sequence cap (clamped to the checkpoint's native max) |
+| `--max-request-branches <N>` | `LAYA_MAX_REQUEST_BRANCHES` | `100` | Max questions per request |
+| `--max-queued <N>` | `LAYA_MAX_QUEUED` | `16` | Admission-queue depth on top of the in-flight forward |
+
 ## Installation
 
 macOS (Apple Silicon) and Linux, via Homebrew:

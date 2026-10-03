@@ -92,6 +92,26 @@ impl RLAgent {
         Ok(Self { tok, special, model, cfg, device })
     }
 
+    /// The checkpoint's native sequence limits: `max_len` (full compiled
+    /// sequence) and `head_max_len` (CLS..SEP head budget). The Jev server
+    /// admission layer (JEV-005) uses `max_len` as one half of its effective
+    /// cap, `min(--max-model-len, checkpoint max_len)`.
+    pub fn checkpoint_limits(&self) -> (usize, usize) {
+        (self.cfg.max_len, self.cfg.head_max_len)
+    }
+
+    /// The agent's tokenizer (read-only access for the Jev server's
+    /// pre-inference sequence admission, JEV-005).
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tok
+    }
+
+    /// The agent's special tokens (read-only; JEV-005 admission builds
+    /// sequences with the same tokenizer + specials `system_one` uses).
+    pub fn special_tokens(&self) -> &SpecialTokens {
+        &self.special
+    }
+
     /// Same as [`Self::load`] but from in-memory file contents (used by the wasm bindings —
     /// there is no filesystem in a browser tab). Always CPU/F32: the only combination that
     /// makes sense client-side.

@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 use laya::agent::answer_to_json;
 use laya::batching::raw_question_to_question;
+use laya::server::{start_server, Answerer, RealAnswerer, ServerConfig};
 use laya::{model_path, route, Checkpoint, QType, Question, RLAgent, RlcdConfig, Trainer};
 
 /// The `model_path::VariantDef` key routed to for a checkpoint (see `router::Checkpoint`).
@@ -41,7 +43,7 @@ struct Args {
     body: String,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum Command {
     /// Ask a single `choice` question against a state string (quick manual smoke test).
     Ask {
@@ -90,10 +92,60 @@ enum Command {
         #[arg(long)]
         save_to: Option<String>,
     },
+    /// Serve a laya checkpoint behind the Jev/Simple-Jev protocol
+    /// (`POST /v1/classifier`, alias `POST /v1/systemone`, `GET /health`,
+    /// `GET /openapi.json`). Loads the checkpoint first (stderr progress),
+    /// binds the listener, then runs until Ctrl-C/SIGTERM (in-flight
+    /// forwards complete before exit). One checkpoint per process.
+    Serve {
+        /// Checkpoint directory to use as-is, bypassing `--model-variant`/`--models-root`.
+        #[arg(long, env = "LAYA_MODEL")]
+        model: Option<PathBuf>,
+        /// Which `model_path::VARIANTS` checkpoint to use when `--model` isn't given.
+        #[arg(long, default_value = "typed-decisions")]
+        model_variant: String,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        /// Effective per-question sequence cap; the checkpoint's native
+        /// `max_len` when omitted, clamped to it when larger.
+        #[arg(long, env = "LAYA_MAX_MODEL_LEN", value_parser = positive_usize, allow_hyphen_values = true)]
+        max_model_len: Option<usize>,
+        /// Max questions per request (the reference's 100).
+        #[arg(long, env = "LAYA_MAX_REQUEST_BRANCHES", default_value_t = 100, value_parser = positive_usize, allow_hyphen_values = true)]
+        max_request_branches: usize,
+        /// Admission queue: waiting slots on top of the one in-flight forward
+        /// (the reference's 16).
+        #[arg(long, env = "LAYA_MAX_QUEUED", default_value_t = 16, value_parser = positive_usize, allow_hyphen_values = true)]
+        max_queued: usize,
+    },
+}
+
+/// A clap value parser for the `--max-*` limits: positive integers only
+/// (`0` / negative values are parse-time usage errors, before any checkpoint
+/// is loaded).
+fn positive_usize(v: &str) -> Result<usize, String> {
+    let n: u32 = v.parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+    if n == 0 {
+        return Err(format!("{n} must be > 0"));
+    }
+    Ok(n as usize)
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // The `serve` subcommand runs inside an ntex runtime (which also owns the
+    // SIGINT/SIGTERM graceful shutdown); every other subcommand stays fully
+    // synchronous. The global `--models-root` (clap
+    // already applied its `LAYA_MODELS_ROOT` env default) is passed in so
+    // serve resolves the checkpoint with the same precedence as ask/answer.
+    if args.command.as_ref().is_some_and(|c| matches!(c, Command::Serve { .. })) {
+        let command = args.command.clone().expect("checked above");
+        let models_root = args.models_root.clone();
+        return ntex::rt::System::new("laya", ntex::rt::DefaultRuntime).block_on(serve(models_root, command));
+    }
 
     if let Some(Command::Ask { model, state, question, options }) = &args.command {
         let checkpoint = route(state);
@@ -234,5 +286,33 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// The `serve` subcommand (JEV-006): resolve + load the checkpoint first
+/// (readable stderr progress), then `start_server` (bind + ntex HttpServer), the
+/// startup banner, and a wait for ntex's ctrl-c/SIGTERM graceful shutdown
+/// (in-flight forwards complete before exit).
+async fn serve(models_root: Option<PathBuf>, command: Command) -> anyhow::Result<()> {
+    let Command::Serve { model, model_variant, host, port, max_model_len, max_request_branches, max_queued } = command else {
+        unreachable!("dispatched for Command::Serve")
+    };
+    // Identical precedence to ask/answer: explicit --model wins; else the
+    // variant's subfolder under --models-root/LAYA_MODELS_ROOT; else the
+    // cached standalone download (model_path::resolve, CHECK-001).
+    let dir = model_path::resolve(&model_variant, model.clone(), Some(model_variant.as_str()), models_root.as_deref())?;
+    // The reported model identity is the value the user supplied at
+    // startup (the reference's "the model ID or local path used to start the
+    // server"): the explicit path's display, else the variant key.
+    let model_name = model.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| model_variant.clone());
+    eprintln!("loading checkpoint: {}", dir.display());
+    let agent = RLAgent::load(&dir)?;
+    let answerer: Arc<dyn Answerer> = Arc::new(RealAnswerer::new(Arc::new(agent)));
+    let config = ServerConfig { max_model_len, max_request_branches, max_queued };
+    let handle = start_server(&host, port, answerer, model_name, config).await?;
+    eprintln!("laya serving '{}' on http://{}:{} (/v1/classifier, /v1/systemone, /health, /openapi.json)", handle.model_name, host, handle.port);
+    // ntex handles Ctrl-C/SIGTERM: stop accepting, finish in-flight forwards, exit.
+    handle.wait().await;
+    eprintln!("laya stopped");
     Ok(())
 }

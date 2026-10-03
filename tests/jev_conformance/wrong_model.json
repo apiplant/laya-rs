@@ -1,0 +1,11 @@
+{
+  "model": "typesafe-ai/jev",
+  "state": "We were billed twice for March. Please refund the duplicate.",
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": { "billing": null, "technical": null }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "model": "convaiinnovations/laya",
+  "messages": [
+    { "role": "system", "content": "You are a support triage assistant." },
+    { "role": "user", "content": "We were billed twice for March. Please refund the duplicate." },
+    { "role": "assistant", "content": "I can help route this. A moment please." }
+  ],
+  "questions": {
+    "route": {
+      "type": "choice",
+      "instructions": "Which team should handle this?",
+      "criteria": { "billing": null, "technical": null }
+    }
+  }
+}
