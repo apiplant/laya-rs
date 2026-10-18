@@ -192,6 +192,30 @@ No macOS Intel build: only Apple Silicon (`aarch64-apple-darwin`) and Linux
 See [`packaging/README.md`](packaging/README.md) for how these packages are
 built and published.
 
+## Models
+
+Checkpoints live in `~/.cache/laya-rs/` (`$XDG_CACHE_HOME/laya-rs`), one directory per Hugging Face repo: `laya-multilingual` and `laya-typed-decisions`. A variant is downloaded on first use when its directory is missing.
+
+If you already have the files (from `git lfs`, `hf download` or another machine), skip the download by putting them
+where it looks, or symlink them there:
+
+```sh
+mkdir -p ~/.cache/laya-rs
+ln -s /path/to/laya-multilingual ~/.cache/laya-rs/laya-multilingual
+```
+
+Each variant directory must contain:
+
+```
+~/.cache/laya-rs/laya-multilingual/
+├── rl_agent_config.json
+├── model.safetensors
+├── encoder/config.json
+└── tokenizer/{tokenizer.json,tokenizer_config.json}
+```
+
+Link each variant under its repo name. `--model DIR` (`LAYA_MODEL`) uses one checkpoint directory directly, `--models-root DIR` (`LAYA_MODELS_ROOT`) looks variants up as subfolders (a clone of `convaiinnovations/laya`), and `LAYA_OFFLINE=1` forbids downloading.
+
 ## Library
 
 `cargo add laya-rs2` pulls in the `laya` crate (native target; the `wasm32-unknown-unknown`
